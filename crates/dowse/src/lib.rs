@@ -101,6 +101,7 @@ mod watch;
 
 pub use events::{Debouncer, PendingChange, PendingOp, WatchEvent};
 pub use ext_groups::by_name as ext_group_by_name;
+pub use extract::{ExtractFailure, ExtractOutcome};
 pub use indexer::{
     IndexProgress, IndexStats, rebuild_index, rebuild_index_with_progress, remove_dir_all_retrying,
 };
@@ -115,7 +116,8 @@ pub use roots::{
 };
 pub use rules::{IndexRules, load_rules, save_rules};
 pub use searcher::{
-    IndexedContentChunk, PreviewHit, SearchHit, SearchPage, Searcher, SortMode, normalize_ranges,
+    FindInDocResult, IndexedContentChunk, PreviewHit, SearchField, SearchHit, SearchPage, Searcher,
+    SortMode, normalize_ranges,
 };
 pub use status::{IndexStatus, index_status};
 pub use updater::{BatchOutcome, IndexUpdater};

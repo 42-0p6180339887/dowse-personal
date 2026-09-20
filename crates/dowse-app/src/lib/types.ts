@@ -5,6 +5,9 @@
 export interface TextSegment {
 	text: string;
 	highlighted: boolean;
+	/** 文内查找的高亮段会带上它在当前文档里的全局命中序号（从 0 起），
+	 * 用来标记"当前是第几个命中"并滚动定位。上下文高亮没有这个字段。 */
+	matchIndex?: number;
 }
 
 export interface SearchHit {
@@ -16,6 +19,15 @@ export interface SearchHit {
 	name_segments: TextSegment[];
 	snippet_segments: TextSegment[];
 	score: number;
+	/** 原文件体积（字节），来自索引里的 size 字段——不是运行时 stat 拿到的，
+	 * 所以文件被移动/删除后这个值仍然可用。 */
+	size: number;
+	/** 原文件修改时间（**毫秒**级 Unix 时间戳），来自索引里的 mtime 字段。
+	 * 为 0 表示建索引时没拿到，界面显示"—"而不是 1970-01-01。 */
+	mtime: number;
+	/** 扩展名（不含点，小写）；无扩展名时是空串。表格"类型"列直接用它，
+	 * 不自己从文件名里截。 */
+	ext: string;
 }
 
 export interface SearchPage {
@@ -25,6 +37,34 @@ export interface SearchPage {
 
 export interface PreviewResult {
 	segments: TextSegment[];
+	/** 索引里这篇文档的 kind："text"/"image" 是正常内容；"err:xxx" 说明这篇
+	 * 文档抽取失败（不支持/加密/损坏/无可提取文字/超限），预览区据此显示
+	 * 明确状态而不是一片空白。短码取值见 Rust 侧 ExtractFailure::kind_code。 */
+	kind: string;
+}
+
+/** 文内查找的一处命中。坐标是 **Unicode 字符**（不是字节、也不是 JS 的
+ * UTF-16 下标）——跟 ContentChunk.offset_chars 同一口径，渲染前要把块内容
+ * 转成码点数组（Array.from）再按这些数字切。 */
+export interface DocMatch {
+	start_char: number;
+	end_char: number;
+}
+
+/** 文内查找结果（find_in_doc 命令）。 */
+export interface FindInDocResult {
+	matches: DocMatch[];
+	total_chars: number;
+}
+
+/** 按块读取的已索引正文（read_content_chunk 命令）。 */
+export interface ContentChunk {
+	content: string;
+	offset_chars: number;
+	returned_chars: number;
+	/** null 表示**全文已加载**（不是读取失败）。 */
+	next_offset_chars: number | null;
+	total_chars: number;
 }
 
 export interface IndexStats {
@@ -57,6 +97,13 @@ export interface IndexProgress {
 	path: string;
 }
 
+/// 状态栏的"索引占用"（index_usage 命令）。bytes 读不到时是 0，界面要显示
+/// "—"而不是"0 B"——否则"读不到"会被显示成"索引不占空间"。
+export interface IndexUsage {
+	bytes: number;
+	num_docs: number;
+}
+
 export interface IndexStatus {
 	has_index: boolean;
 	num_docs: number;
@@ -79,10 +126,21 @@ export interface IndexingSnapshot {
 }
 
 /// 类型筛选下拉的取值，跟 Rust 侧 dowse-core::ext_groups::by_name 认的字符串一一对应。
-export type ExtGroup = 'all' | 'doc' | 'code' | 'image';
+/// 两档：`doc`/`code`/`image` 是粗粒度，`pdf`/`word`/`excel`/`ppt`/`text` 是界面
+/// "类型"下拉里那六个具体选项（对应"我要找那份 Excel"的实际心智）。
+export type ExtGroup = 'all' | 'doc' | 'code' | 'image' | 'pdf' | 'word' | 'excel' | 'ppt' | 'text';
 
 /// 排序下拉的取值，跟 Rust 侧 dowse-core::SortMode::parse 认的字符串一一对应。
-export type SortOption = 'relevance' | 'mtime_desc' | 'mtime_asc' | 'size_desc';
+export type SortOption =
+	| 'relevance'
+	| 'mtime_desc'
+	| 'mtime_asc'
+	| 'size_desc'
+	| 'size_asc';
+
+/// 搜索模式，跟 Rust 侧 dowse::SearchField 一一对应：'content' 查文件名+正文
+/// （默认），'name' 只查文件名。
+export type SearchField = 'content' | 'name';
 
 export type EffectLevel = 'acrylic' | 'mica' | 'solid';
 

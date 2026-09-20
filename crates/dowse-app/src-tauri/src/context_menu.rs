@@ -5,7 +5,6 @@ use tauri::menu::{Menu, MenuEvent, MenuItemBuilder};
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
-use crate::autohide::AutoHideSuppressor;
 
 const ITEM_OPEN: &str = "ctxmenu-open";
 const ITEM_REVEAL: &str = "ctxmenu-reveal";
@@ -49,7 +48,6 @@ pub fn show_result_context_menu(
     app: AppHandle,
     window: WebviewWindow,
     target: State<ContextMenuTarget>,
-    suppressor: State<AutoHideSuppressor>,
     path: String,
 ) -> Result<(), String> {
     target.set(PathBuf::from(&path));
@@ -74,9 +72,9 @@ pub fn show_result_context_menu(
     )
     .map_err(|e| e.to_string())?;
 
-    // 原生菜单抢焦点期间临时抑制失焦自动隐藏；guard 在本函数返回时释放
-    // （不管菜单是被选中还是直接取消），不会因为提前 return 漏掉配对的释放。
-    let _guard = suppressor.suppress_for_menu();
+    // 原生菜单抢焦点这件事不需要额外处理了：自用版的窗口是常驻文档窗口，
+    // 不再有"失焦即隐藏"那条逻辑，所以也没有"菜单弹出期间要豁免自动隐藏"
+    // 一说（上游那套 AutoHideSuppressor 已随之删掉）。
     window.popup_menu(&menu).map_err(|e| e.to_string())?;
     Ok(())
 }

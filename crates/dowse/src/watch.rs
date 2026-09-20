@@ -182,6 +182,8 @@ fn emit_best_effort(path: &Path, tx: &Sender<WatchEvent>) {
 /// 监听循环对外汇报的进度，给 CLI 打日志、给托盘端刷新状态用。
 #[derive(Debug, Clone)]
 pub enum WatchProgress {
+    /// Startup reconciliation has made offline changes visible to readers.
+    Reconciled,
     /// 收到一个原始事件（防抖前）。
     Received(WatchEvent),
     /// 一批防抖后的变更已提交入索引。
@@ -365,6 +367,7 @@ pub fn watch_roots_auto(
                 eprintln!("启动对账 {} 失败: {err}", root.display());
             }
         }
+        on_progress(WatchProgress::Reconciled);
         return run_watch(NotifyEventSource, &slow_roots, updater, stop, move |p| {
             on_progress(p)
         });
@@ -379,6 +382,7 @@ pub fn watch_roots_auto(
 
     #[cfg(windows)]
     {
+        on_progress(WatchProgress::Reconciled);
         let on_progress = Arc::new(on_progress);
         let slow_handle = if slow_roots.is_empty() {
             None
@@ -394,6 +398,7 @@ pub fn watch_roots_auto(
                         eprintln!("启动对账 {} 失败: {err}", root.display());
                     }
                 }
+                on_progress(WatchProgress::Reconciled);
                 let on_progress = on_progress.clone();
                 if let Err(err) =
                     run_watch(NotifyEventSource, &slow_roots, updater, stop, move |p| {
@@ -443,6 +448,7 @@ pub fn watch_roots_auto(
                         eprintln!("启动对账 {} 失败: {err}", root.display());
                     }
                 }
+                on_progress_for_fallback(WatchProgress::Reconciled);
                 run_watch(
                     NotifyEventSource,
                     &fast_roots_for_fallback,

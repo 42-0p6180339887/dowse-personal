@@ -7,7 +7,6 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 use tauri_plugin_opener::OpenerExt;
 
 use crate::HotkeyState;
-use crate::autohide::AutoHideSuppressor;
 use crate::config::ConfigState;
 use crate::file_icons::FileIconCache;
 use crate::highlight::{TextSegment, highlight_name, segments_from_ranges};
@@ -31,6 +30,15 @@ pub struct SearchHitDto {
     pub name_segments: Vec<TextSegment>,
     pub snippet_segments: Vec<TextSegment>,
     pub score: f32,
+    /// 原文件体积（字节），来自索引里的 `size` 字段——结果表格的"大小"列直接
+    /// 用这个，不要为显示而逐文件 stat 文件系统。
+    pub size: u64,
+    /// 原文件修改时间（**毫秒**级 Unix 时间戳），来自索引里的 `mtime` 字段。
+    /// 建索引时没拿到时为 0，前端应对 0 显示"—"而不是 1970-01-01。
+    pub mtime: i64,
+    /// 扩展名（不含点，小写）；无扩展名时是空串。表格"类型"列与类型筛选共用
+    /// 这一个来源，避免前端再自己从名字里截一遍。
+    pub ext: String,
 }
 
 #[derive(Serialize)]
@@ -42,6 +50,38 @@ pub struct SearchPageDto {
 #[derive(Serialize)]
 pub struct PreviewDto {
     pub segments: Vec<TextSegment>,
+    /// 索引里这篇文档的 kind："text"/"image" 是正常内容；"err:xxx" 是抽取
+    /// 失败的状态占位文档（见 dowse::ExtractFailure 的短码），前端据此显示
+    /// "不支持/加密/损坏/无可提取文字/超限"的明确状态，而不是一页空白。
+    pub kind: String,
+}
+
+/// 文内查找的一处命中。坐标约定：**Unicode 字符**（不是字节、也不是 UTF-16
+/// 下标）——跟 `read_content_chunk` 的 `offset_chars` 同一口径，前端要先
+/// 把块内容转成码点数组再按这些数字切，否则中文/emoji 会错位。
+#[derive(Serialize)]
+pub struct DocMatchDto {
+    pub start_char: usize,
+    pub end_char: usize,
+}
+
+/// 文内查找结果：命中列表 + 全文总字符数。
+#[derive(Serialize)]
+pub struct FindInDocDto {
+    pub matches: Vec<DocMatchDto>,
+    /// 全文总 Unicode 字符数，前端据此计算分块序号、显示进度。
+    pub total_chars: usize,
+}
+
+/// 按块读取的已索引正文（全文阅读视图用）。
+#[derive(Serialize)]
+pub struct ContentChunkDto {
+    pub content: String,
+    pub offset_chars: usize,
+    pub returned_chars: usize,
+    /// 下一页起点；null 表示**全文已加载**（不是"读取失败"）。
+    pub next_offset_chars: Option<usize>,
+    pub total_chars: usize,
 }
 
 #[derive(Serialize)]
@@ -115,6 +155,54 @@ pub fn index_status(search: State<SearchState>) -> IndexStatusDto {
     }
 }
 
+/// 状态栏的"索引占用"：索引目录实际占用的磁盘字节数 + 当前文档数。
+///
+/// `bytes` 读不到时给 0，前端要显示"—"而不是"0 B"——否则"读不到"会被显示成
+/// "索引不占空间"，是误导。文档数跟 `index_status` 同一口径（含抽取失败的
+/// 状态占位文档）。
+#[derive(Serialize)]
+pub struct IndexUsageDto {
+    /// 索引目录占用的磁盘字节数；目录不存在或读不到时为 0。
+    pub bytes: u64,
+    /// 索引里的文档总数。
+    pub num_docs: u64,
+}
+
+/// 递归累加目录树下的全部文件长度。用显式栈而不是递归——索引目录层级不深，
+/// 但迭代版顺带免掉目录极多时的栈深度顾虑。权限读不到的子目录/文件直接跳过：
+/// 一个子目录读不了不该让整块状态栏报错。
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            match entry.metadata() {
+                Ok(meta) if meta.is_dir() => stack.push(entry.path()),
+                Ok(meta) => total += meta.len(),
+                Err(_) => continue,
+            }
+        }
+    }
+    total
+}
+
+#[tauri::command]
+pub fn index_usage(search: State<SearchState>) -> IndexUsageDto {
+    let num_docs = search
+        .0
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|s| s.num_docs()))
+        .unwrap_or(0);
+    let bytes = crate::config::index_dir()
+        .map(|dir| dir_size(&dir))
+        .unwrap_or(0);
+    IndexUsageDto { bytes, num_docs }
+}
+
 /// 建索引进度的当前快照——窗口每次呼出都应该拉一次这个，再接续事件流
 /// （`dowse://rebuild-progress`/`dowse://ocr-progress`）：窗口隐藏期间事件照样
 /// 会发，但前端没监听、没地方存，重新唤出时必须能补一次，不能是一片空白
@@ -129,6 +217,9 @@ pub fn indexing_status(status: State<IndexingStatus>) -> IndexingSnapshot {
 /// dowse 一处定义，Tauri 这层只是原样转发字符串，不在这里重复一份映射表。
 /// `ext_group`/`sort` 都是可选参数：不传、传 "all"/未知字符串都表示不筛选/
 /// 用默认相关性排序，前端传坏了也不会让搜索报错。
+// 入参个数到 clippy 上限是因为 Tauri 命令必须把每个入参平铺成独立参数（前端
+// invoke 传的是对象，框架按名逐个注入，包成结构体反而要前端改传参形状）。
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn search(
     search: State<SearchState>,
@@ -137,6 +228,11 @@ pub fn search(
     offset: usize,
     ext_group: Option<String>,
     sort: Option<String>,
+    // 搜索范围：限定在某个索引根下（界面"范围"下拉）。None/空串/未知值都表示
+    // 不限范围。语义是"路径以该根开头"，不是 `path:` 操作符那种分词子词匹配。
+    root: Option<String>,
+    // 搜索模式："name" 只查文件名，其余（含 None）查文件名+正文。
+    field: Option<String>,
 ) -> Result<SearchPageDto, String> {
     let guard = search.0.lock().map_err(|_| "搜索状态异常".to_string())?;
     let Some(searcher) = guard.as_ref() else {
@@ -148,9 +244,21 @@ pub fn search(
 
     let group = dowse::ext_group_by_name(ext_group.as_deref());
     let sort_mode = dowse::SortMode::parse(sort.as_deref());
+    let field = match field.as_deref() {
+        Some("name") => dowse::SearchField::Name,
+        _ => dowse::SearchField::Content,
+    };
 
     let page = searcher
-        .search_paged(&query, limit, offset, group, sort_mode)
+        .search_scoped(
+            &query,
+            limit,
+            offset,
+            group,
+            sort_mode,
+            root.as_deref(),
+            field,
+        )
         .map_err(|e| e.to_string())?;
     let hits = page
         .hits
@@ -166,6 +274,9 @@ pub fn search(
                 name_segments,
                 snippet_segments,
                 score: hit.score,
+                size: hit.size,
+                mtime: hit.mtime,
+                ext: hit.ext,
             }
         })
         .collect();
@@ -191,6 +302,82 @@ pub fn preview(
     };
     Ok(Some(PreviewDto {
         segments: segments_from_ranges(&hit.snippet, &hit.highlighted),
+        kind: hit.kind,
+    }))
+}
+
+/// 全文阅读视图：按 Unicode 字符分块读取**已索引正文**（不重新解析原文件，
+/// 保持只读边界）。`offset_chars` 传 0 即从头读；返回里 `next_offset_chars`
+/// 为 null 表示"全文已加载"，非 null 则前端可以继续按这个起点往下读。
+/// 路径不在索引里返回 None（文件可能被删/改名/还没收录）。
+#[tauri::command]
+pub fn read_content_chunk(
+    search: State<SearchState>,
+    path: String,
+    offset_chars: usize,
+    max_chars: usize,
+) -> Result<Option<ContentChunkDto>, String> {
+    // 分块上限兜一层：前端传 0 会让 Rust 侧直接报错，传超大值等于把整篇
+    // 几 MB 正文一次性塞进 IPC，都不合适。上限取 MCP 那条读取通道的同档位。
+    if max_chars == 0 || max_chars > MAX_CONTENT_CHUNK_CHARS {
+        return Err(format!(
+            "max_chars 必须在 1..={MAX_CONTENT_CHUNK_CHARS} 之间"
+        ));
+    }
+    let guard = search.0.lock().map_err(|_| "搜索状态异常".to_string())?;
+    let Some(searcher) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let Some(chunk) = searcher
+        .read_indexed_content_chunk(&path, offset_chars, max_chars)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ContentChunkDto {
+        content: chunk.content,
+        offset_chars: chunk.offset_chars,
+        returned_chars: chunk.returned_chars,
+        next_offset_chars: chunk.next_offset_chars,
+        total_chars: chunk.total_chars,
+    }))
+}
+
+/// 单次分块读取的字符数上限：跟 MCP 读取通道同档，避免一次 IPC 拖太多正文。
+const MAX_CONTENT_CHUNK_CHARS: usize = 100_000;
+
+/// 文内字面查找：在指定文档的已索引全文上找 `needle` 的所有出现，返回
+/// **Unicode 字符坐标**的命中区间。忽略英文大小写，正则符号按普通文字处理
+/// （语义细节见 `dowse::Searcher::find_in_document`）。前端据此显示
+/// "第 n / 共 m 个"并把命中位置映射到对应正文块。
+///
+/// 路径不在索引里返回 None——前端据此提示"索引里找不到这篇文档"。
+#[tauri::command]
+pub fn find_in_doc(
+    search: State<SearchState>,
+    path: String,
+    needle: String,
+) -> Result<Option<FindInDocDto>, String> {
+    let guard = search.0.lock().map_err(|_| "搜索状态异常".to_string())?;
+    let Some(searcher) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let Some(result) = searcher
+        .find_in_document(&path, &needle)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(FindInDocDto {
+        matches: result
+            .matches
+            .into_iter()
+            .map(|r| DocMatchDto {
+                start_char: r.start,
+                end_char: r.end,
+            })
+            .collect(),
+        total_chars: result.total_chars,
     }))
 }
 
@@ -281,19 +468,25 @@ pub fn add_root(app: tauri::AppHandle, dir: String) -> Result<IndexStatsDto, Str
     result
 }
 
-/// 图钉固定开关：前端点了图钉按钮就调这个命令，把会话级的"抑制失焦自动
-/// 隐藏"状态同步到 Rust 侧（见 autohide.rs 的 `AutoHideSuppressor`）。
-/// 不落盘——重启应用后前端按钮状态和这里的计数器都回到初始值。
+/// 图钉开关：前端点了图钉按钮就调这个命令，把窗口切成/取消**窗口置顶**。
+///
+/// 自用版的窗口是常驻文档窗口、不再随失焦自动隐藏，所以图钉原来的含义
+/// （"固定期间不自动收起"）已经没有意义了；保留按钮但把它接到真正有用的
+/// 能力上：一边看着别的程序里的资料、一边查自己的文档时，把搜索窗口压在
+/// 最上层。不落盘——重启应用后回到 tauri.conf.json 里的默认值
+/// （`alwaysOnTop: false`）。
 #[tauri::command]
-pub fn set_pinned(suppressor: State<AutoHideSuppressor>, pinned: bool) {
-    suppressor.set_pinned(pinned);
+pub fn set_pinned(window: tauri::WebviewWindow, pinned: bool) -> Result<(), String> {
+    window
+        .set_always_on_top(pinned)
+        .map_err(|e| format!("切换窗口置顶失败: {e}"))
 }
 
 /// 索引规则面板的读取入口：取当前索引目录旁 rules.json 里的规则（没配过就
 /// 是逐字节等于老硬编码行为的默认值，见 `dowse::rules` 模块文档）。面板
 /// Ctrl+, 打开时调一次拿表单初值。索引目录跟 `rebuild_index`/`add_root`
 /// 用的是同一个（`crate::config::index_dir()`，固定在
-/// `%LOCALAPPDATA%\dowse\index`），不需要额外传参区分。
+/// `%LOCALAPPDATA%\dowse-personal\data\index`），不需要额外传参区分。
 #[tauri::command]
 pub fn get_rules() -> Result<dowse::IndexRules, String> {
     let dir = crate::config::index_dir().map_err(|e| e.to_string())?;

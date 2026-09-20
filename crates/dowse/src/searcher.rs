@@ -4,8 +4,10 @@
 //! [`SortMode`] 控制按相关性还是按 mtime/size 排序。也提供按路径取更大窗口
 //! 预览内容（[`PreviewHit`]）和分块读取已索引正文（[`IndexedContentChunk`]）的能力。
 
+use std::collections::{HashMap, VecDeque};
 use std::ops::{Bound, Range};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use tantivy::collector::{Count, TopDocs};
@@ -141,6 +143,9 @@ pub enum SortMode {
     MtimeAsc,
     /// 按文件体积降序：最大的排在前面。
     SizeDesc,
+    /// 按文件体积升序：最小的排在前面。结果表格点"大小"列头第二次用它——
+    /// 只给降序的话，用户没法从"找那份大文件"切回"找那份小文件"。
+    SizeAsc,
 }
 
 impl SortMode {
@@ -164,6 +169,7 @@ impl SortMode {
             Some("mtime_desc") => Self::MtimeDesc,
             Some("mtime_asc") => Self::MtimeAsc,
             Some("size_desc") => Self::SizeDesc,
+            Some("size_asc") => Self::SizeAsc,
             _ => Self::Relevance,
         }
     }
@@ -206,6 +212,13 @@ pub struct SearchHit {
     pub highlighted: Vec<Range<usize>>,
     /// 文件扩展名（不含点，小写），无扩展名时是空串。给 MCP 等消费方标注文件类型用。
     pub ext: String,
+    /// 原文件体积（字节），来自建索引时存的 `size` 字段——**不是运行时 stat 文件系统**。
+    /// 结果列表要显示体积/按体积排序时直接用这个，逐文件 stat 会让一页结果多出几十次
+    /// 系统调用，而且文件被删/改名后就拿不到值了。
+    pub size: u64,
+    /// 原文件修改时间（毫秒级 Unix 时间戳），同样来自索引里的 `mtime` 字段，不是 stat。
+    /// 取不到时为 0，调用方（前端）应对 0 显示为"—"而不是 1970-01-01。
+    pub mtime: i64,
 }
 
 /// 按路径取的预览内容，字段契约和 SearchHit 的 snippet/highlighted 一致，
@@ -221,6 +234,10 @@ pub struct PreviewHit {
     pub mtime: i64,
     /// 文件扩展名（不含点，小写），无扩展名时是空串。
     pub ext: String,
+    /// 索引里这篇文档的 kind：正常文本是 "text"、图片是 "image"、抽取失败的
+    /// 占位文档是 "err:xxx" 短码（见 [`crate::extract::ExtractFailure::kind_code`]）。
+    /// 前端据此在预览区给出"不支持/加密/损坏/无可提取文字/超限"的明确状态。
+    pub kind: String,
 }
 
 /// 按 Unicode 字符分页的一段已索引正文。
@@ -236,6 +253,22 @@ pub struct IndexedContentChunk {
     pub returned_chars: usize,
     /// 下一页起点；没有下一页时为 None。
     pub next_offset_chars: Option<usize>,
+    /// 全文总 Unicode 字符数。和 `next_offset_chars == None` 一起，调用方可以
+    /// 同时给出"还有内容/全文已加载"和整体进度。
+    pub total_chars: usize,
+}
+
+/// 文内查找的结果。**坐标约定：所有区间一律按 Unicode 字符（标量值）计数**，
+/// 与 [`Searcher::read_indexed_content_chunk`] 的 `offset_chars` 同一口径——
+/// 调用方不要拿这些数字去切 Rust 侧的 UTF-8 字节串或 JS 侧的 UTF-16 下标，
+/// 必须先转成各自的字符数组再定位，否则中文/emoji 会错位。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindInDocResult {
+    /// 全部命中的字符区间 `[start, end)`，按起点排序且互不重叠（贪心推进，
+    /// 同一位置的重复命中只记一次）。
+    pub matches: Vec<Range<usize>>,
+    /// 被查文档的全文总字符数（Unicode 字符）。
+    pub total_chars: usize,
 }
 
 /// 一页搜索结果：当前页命中列表加上"匹配总数"。
@@ -251,17 +284,185 @@ pub struct SearchPage {
     pub total: usize,
 }
 
+/// 搜哪个字段——界面对应的就是"模式"下拉里的「内容 / 文件名」两项。
+///
+/// `Content` 是默认行为：**同时**查文件名和正文。这不是偷懒——用户搜"季度报告"
+/// 时期望文件名叫"季度报告.docx"的排在前面，正文里出现该词的同样该出现。
+/// `Name` 只在文件名上查，用来找"那个叫什么什么的文件"，此时正文里的同名词
+/// 不该把一堆无关文档拉进结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchField {
+    /// 文件名 + 正文（默认）。
+    #[default]
+    Content,
+    /// 只查文件名。
+    Name,
+}
+
+/// 正文缓存的字节预算。按**字节**而不是条目数算：一篇 5MB 的长文档和一篇
+/// 5KB 的笔记不该占同样份额。32MB 足够"连着翻几篇长文"不重复解压，又不会让
+/// 常驻内存无上限地涨。
+const CONTENT_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
+/// 缓存的条目数上限。字节预算管的是"总共占多大"，但它挡不住**空正文和极短文**
+/// ——那些条目字节数接近 0，只按字节算能堆到几十万条，`order` 队列和 HashMap 自身
+/// 的开销（每条还要存一份路径字符串）照样能把内存吃满。所以两个上限一起卡，
+/// 先到先触发。
+const CONTENT_CACHE_MAX_ENTRIES: usize = 512;
+
+/// 缓存里的一篇文档正文。
+///
+/// **只存一份 `Arc<str>`**——刻意不额外存完整的 `Vec<char>`、小写折叠副本等：
+/// 那会让常驻内存翻两三倍，而它们都能在用到时现算。
+#[derive(Clone)]
+struct CachedDoc {
+    content: Arc<str>,
+    /// 全文字符数（Unicode 标量值）。每次分块读取都重新数一遍是纯浪费，
+    /// 跟正文一起缓存。
+    total_chars: usize,
+}
+
+/// 有界 LRU 正文缓存：按字节预算和条目数上限淘汰最久未用的文档。
+///
+/// 缓存绑定 Tantivy 的实际快照代号；自动重载与显式 reload 都会使旧正文失效。
+/// 每次读取固定使用同一个快照查缓存和读正文，避免把不同版本混在一起。
+///
+/// 但"清空"和"回填"之间有个并发窗口：`cached_doc` 是在**释放锁之后**才去读索引
+/// 的（读索引要走 Tantivy 文档存储，可能不快，不该压着锁做），如果这中间别人
+/// reload 了，回填进去的就是**旧快照**的正文，而缓存已经认为自己是最新的了——
+/// 那篇文档会一直返回过期内容直到下次 reload。用 `generation` 堵这个窗口：
+/// reload 递增它，回填时比对读之前记下的代号，对不上就干脆不写（最多少缓存一次，
+/// 下次读会补上）。桌面外层虽然用锁串行了这些调用，但 `Searcher` 是公开 API，
+/// 不能指望调用方都这么做。
+#[derive(Default)]
+struct ContentCache {
+    /// Tantivy may reload automatically without calling Searcher::reload.
+    snapshot_generation: Option<u64>,
+    map: HashMap<String, CachedDoc>,
+    /// 最近使用顺序，队尾是最近用过的；淘汰从队头开始。
+    order: VecDeque<String>,
+    bytes: usize,
+    /// 快照代号，每次 `clear` 递增。见结构体文档里的并发窗口说明。
+    generation: u64,
+}
+
+impl ContentCache {
+    fn get(&mut self, key: &str) -> Option<CachedDoc> {
+        let doc = self.map.get(key)?.clone();
+        // 命中就挪到队尾。用 position+remove 而不是 retain：这里的条目数最多
+        // 几十个，O(n) 扫描比维护额外索引简单且足够快。
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+            self.order.push_back(key.to_string());
+        }
+        Some(doc)
+    }
+
+    fn put(&mut self, key: String, doc: CachedDoc) {
+        let size = doc.content.len();
+        // 单篇就超过整个预算的话干脆不缓存——否则它一进来就会把别的全挤掉，
+        // 缓存退化成"只装得下一篇"还多一次拷贝开销。
+        if size > CONTENT_CACHE_BUDGET_BYTES {
+            return;
+        }
+        // 覆盖同一个 key 时**必须先把旧的位置从 order 里摘掉**，否则重复 put 同一
+        // 篇会让 order 里堆满同一 key 的副本：队列长度和 map 条目数脱钩，后面淘汰
+        // 时连着 pop 出来的都是已经不在 map 里的空转条目，真正的旧条目反而留着，
+        // 内存就压不住了。
+        if let Some(pos) = self.order.iter().position(|k| k == &key) {
+            self.order.remove(pos);
+        }
+        if let Some(old) = self.map.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old.content.len());
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, doc);
+        self.bytes += size;
+        // 两个上限一起卡：字节数（防长文吃满内存）和条目数（防大量空文/极短文
+        // 靠"每条几乎不占字节"绕过字节预算）。
+        while self.bytes > CONTENT_CACHE_BUDGET_BYTES
+            || self.map.len() > CONTENT_CACHE_MAX_ENTRIES
+        {
+            let Some(victim) = self.order.pop_front() else { break };
+            if let Some(old) = self.map.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(old.content.len());
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.snapshot_generation = None;
+        self.map.clear();
+        self.order.clear();
+        self.bytes = 0;
+        // 递增快照代号：让"清空之后才回填"的旧快照内容自己认不出来、不再写入。
+        // 用 wrapping_add 而不是 +=：代号是拿来比对相等性的，溢出绕回去不会让
+        // 它跟任何一个还在用的旧值撞上（要连续 reload 2^64 次才可能），真绕回去
+        // 也不会 panic——release 下 += 溢出是静默回绕，debug 下直接崩，这不行。
+        self.generation = self.generation.wrapping_add(1);
+    }
+}
+
 /// 一个索引的只读搜索句柄。
 ///
 /// `Searcher` 只读打开索引，可以和一个并发的写入端（[`crate::IndexUpdater`]、
 /// 实时监听、全量重建）共存于同一份索引之上——tantivy 的段文件不可变，读写能
-/// 跨线程甚至跨进程并行。代价是 reader 持有的是打开那一刻的段快照，不会自动感知
-/// 之后别处提交的新写入；要读到最新一次 commit 的结果，调用方必须显式调用
-/// [`Searcher::reload`]。
+/// 跨线程甚至跨进程并行。reader 默认在 commit 后异步重载；需要立即读到最新
+/// commit 时可显式调用 [`Searcher::reload`]。两种重载都会使旧正文缓存失效。
 pub struct Searcher {
     reader: IndexReader,
+    /// 默认解析器：不带字段前缀的词同时打到 `name` 和 `content` 上。
     parser: QueryParser,
+    /// 只把词打到 `name` 一个字段上的解析器——"模式=文件名"时用它替换 `parser`。
+    /// 预建而不是每次查询临时构造：`QueryParser::for_index` 要按字段名反查
+    /// schema，搜索是热路径，不值得每敲一次键重做一遍。
+    name_parser: QueryParser,
+    /// 已索引正文的有界缓存。翻同一篇文档的第 2、3…块时不再重复从 Tantivy
+    /// 文档存储读取并解压——`read_indexed_content_chunk` 原来每块都要把整篇
+    /// 正文取出来再跳过 offset，越往后读重复工作越多。
+    content_cache: Mutex<ContentCache>,
     fields: Fields,
+}
+
+/// 把调用方给的范围根路径，展开成索引里 `path` 字段**所有可能的写法**。
+///
+/// 索引里的 path 是 `canonicalize` 的产物：Windows 上是 `\\?\C:\a\b` 这种
+/// verbatim 形态、分隔符是反斜杠。而调用方给的可能带 `\\?\` 也可能不带，手写
+/// 命令行或前端拼串时还常写成正斜杠。这三件事不统一，前缀范围就一条都匹配不上，
+/// 表现是"明明选了范围，结果却是空的"——比不过滤还糟。
+///
+/// 返回去重后的候选形态，由调用方用 Should 并起来（宁可多一个永不命中的分支）。
+fn scope_root_variants(root: &str) -> Vec<String> {
+    // 去掉结尾的分隔符：留着的话拼前缀时会多出一个分隔符，连 root 自身都匹配不到。
+    let mut base = root.trim();
+    while base.ends_with('/') || base.ends_with('\\') {
+        base = &base[..base.len() - 1];
+    }
+    if base.is_empty() {
+        return Vec::new();
+    }
+    // 正斜杠统一成本平台的分隔符（Windows 是 \，Unix 是 /）。
+    let plain = if cfg!(windows) {
+        base.replace('/', r"\")
+    } else {
+        base.to_string()
+    };
+
+    let mut out: Vec<String> = vec![plain.clone()];
+    if cfg!(windows) {
+        // 一边补 verbatim 前缀、一边剥掉它：调用方给不带前缀的就补，已经带了就剥，
+        // 两种方向都要覆盖，不然总有一半调用方会踩空。
+        let verbatim = format!(r"\\?\{plain}");
+        if !out.contains(&verbatim) {
+            out.push(verbatim);
+        }
+        if let Some(stripped) = plain.strip_prefix(r"\\?\")
+            && !out.contains(&stripped.to_string())
+        {
+            out.push(stripped.to_string());
+        }
+    }
+    out
 }
 
 impl Searcher {
@@ -299,11 +500,16 @@ impl Searcher {
         // 用户敲"限流 中间件"是想要同时含两个词的文档，不是含任意一个词都行。
         // 带引号的短语查询不受影响，QueryParser 会先切出短语再对词间加 AND。
         parser.set_conjunction_by_default();
+        // 只查文件名那份：字段列表只给 name，其余配置（AND 合取）跟默认解析器一致。
+        let mut name_parser = QueryParser::for_index(&index, vec![fields.name]);
+        name_parser.set_conjunction_by_default();
         let reader = index.reader()?;
 
         Ok(Self {
             reader,
             parser,
+            name_parser,
+            content_cache: Mutex::new(ContentCache::default()),
             fields,
         })
     }
@@ -414,15 +620,74 @@ impl Searcher {
         ext_group: Option<&[&str]>,
         sort: SortMode,
     ) -> Result<SearchPage> {
+        self.search_scoped(
+            query_str,
+            limit,
+            offset,
+            ext_group,
+            sort,
+            None,
+            SearchField::Content,
+        )
+    }
+
+    /// 在 [`search_paged`](Self::search_paged) 之上多两个界面要用的维度：
+    ///
+    /// - `root`：把结果限定在某个索引根下（界面"范围"下拉）。走 path 字段的
+    ///   **前缀范围**匹配，不是 `path:` 操作符那套分词子词 AND——后者会把
+    ///   `D:\Other\Docs` 也算进"范围 = D:\Docs"里，筛选等于没生效。
+    /// - `field`：查"内容"还是"只查文件名"（界面"模式"下拉）。
+    ///
+    /// 两者取默认值时与 `search_paged` 完全等价。
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn main() -> anyhow::Result<()> {
+    /// use std::path::Path;
+    /// use dowse::{SearchField, Searcher, SortMode};
+    ///
+    /// let searcher = Searcher::open(Path::new("./my-index"))?;
+    /// // 只在 D:\Docs 这个根下、只按文件名找。
+    /// let page = searcher.search_scoped(
+    ///     "季度", 20, 0, None, SortMode::Relevance,
+    ///     Some("D:\\Docs"), SearchField::Name,
+    /// )?;
+    /// println!("{}", page.total);
+    /// # Ok(())
+    /// # }
+    /// ```
+    // 8 个入参确实到了 clippy 的上限，但这是"搜索"这一件事的全量维度（词、页码、
+    // 类型、排序、范围、字段），拆成 builder 或参数结构体只是把同样的 8 项换个
+    // 地方排——调用方要写的字一样多，却多了一层要记的类型名。这里保留平铺签名，
+    // 靠默认值让多数调用方只填前 5 个。
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_scoped(
+        &self,
+        query_str: &str,
+        limit: usize,
+        offset: usize,
+        ext_group: Option<&[&str]>,
+        sort: SortMode,
+        root: Option<&str>,
+        field: SearchField,
+    ) -> Result<SearchPage> {
+        let parser = match field {
+            SearchField::Content => &self.parser,
+            SearchField::Name => &self.name_parser,
+        };
         // 把查询串解析成（检索用查询, 只含内容词的高亮查询）：普通输入走稳定的
         // autocomplete 召回；查询语法和结构化操作符仍按原 QueryParser/规则拼。摘要只
         // 认内容词那份，path:/mtime:/size: 这些操作符不进高亮（它们的 term 落在别的
         // 字段上，SnippetGenerator 绑定在 content 字段，本就不会拿它们去标原文，这里
         // 再用纯内容查询喂它是双保险，也让意图更清楚）。
         let typeahead_prefix = typeahead_prefix_token(query_str);
-        let (retrieval_query, snippet_query) = self.build_queries(query_str)?;
-        let query: Box<dyn Query> = match ext_group {
-            Some(exts) if !exts.is_empty() => {
+        let (retrieval_query, snippet_query) = self.build_queries(query_str, parser, field)?;
+
+        // 过滤条件一律挂 Must：检索查询 AND 类型分组 AND 范围。
+        let mut musts: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, retrieval_query)];
+        if let Some(exts) = ext_group {
+            if !exts.is_empty() {
                 let ext_should: Vec<(Occur, Box<dyn Query>)> = exts
                     .iter()
                     .map(|ext| {
@@ -435,15 +700,21 @@ impl Searcher {
                         )
                     })
                     .collect();
-                Box::new(BooleanQuery::new(vec![
-                    (Occur::Must, retrieval_query),
-                    (
-                        Occur::Must,
-                        Box::new(BooleanQuery::new(ext_should)) as Box<dyn Query>,
-                    ),
-                ]))
+                musts.push((
+                    Occur::Must,
+                    Box::new(BooleanQuery::new(ext_should)) as Box<dyn Query>,
+                ));
             }
-            _ => retrieval_query,
+        }
+        if let Some(root_query) = root.map(str::trim).filter(|r| !r.is_empty()).and_then(|r| self.build_root_query(r)) {
+            musts.push((Occur::Must, root_query));
+        }
+        // 只有一个 Must 时不套 BooleanQuery——保持跟老代码一致的查询形状，
+        // 也省一层 DocSet 组合开销。
+        let query: Box<dyn Query> = if musts.len() == 1 {
+            musts.pop().expect("刚判过长度为 1").1
+        } else {
+            Box::new(BooleanQuery::new(musts))
         };
         let searcher = self.reader.searcher();
 
@@ -516,6 +787,21 @@ impl Searcher {
                     total,
                 )
             }
+            SortMode::SizeAsc => {
+                let (top, total) = searcher.search(
+                    &query,
+                    &(
+                        TopDocs::with_limit(limit)
+                            .and_offset(offset)
+                            .order_by_fast_field::<u64>("size", Order::Asc),
+                        Count,
+                    ),
+                )?;
+                (
+                    top.into_iter().map(|(_, addr)| (0.0, addr)).collect(),
+                    total,
+                )
+            }
         };
 
         let mut hits = Vec::with_capacity(addrs.len());
@@ -535,6 +821,18 @@ impl Searcher {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_owned();
+            // size/mtime 直接从索引的 fast field 读，跟 preview() 的 doc_meta 同一口径。
+            // 结果列表要在表格里显示"修改时间/体积"并支持按这两列排序，若改成运行时
+            // stat，一页 50 条就是 50 次系统调用，且文件被移动/删除后会拿不到值——
+            // 索引里的值是建索引那一刻的快照，文件不在了也仍然可用。
+            let size = doc
+                .get_first(self.fields.size)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let mtime = doc
+                .get_first(self.fields.mtime)
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
 
             let (snippet, highlighted) = match typeahead_prefix.as_deref() {
                 Some(prefix) => {
@@ -548,6 +846,8 @@ impl Searcher {
                 snippet,
                 highlighted,
                 ext,
+                size,
+                mtime,
             });
         }
         Ok(SearchPage { hits, total })
@@ -559,19 +859,27 @@ impl Searcher {
     /// 分叉在这里：没有操作符且只含普通输入字符时走 autocomplete 查询计划；引号等
     /// QueryParser 语法仍交回原解析器；`path:` / `mtime:` / `size:` / `OR` / `NOT`
     /// 等结构化操作符走下面的显式拼装。
-    fn build_queries(&self, query_str: &str) -> Result<(Box<dyn Query>, Box<dyn Query>)> {
+    /// `parser` 由调用方按"模式"选定：内容模式传 `self.parser`（name+content），
+    /// 文件名模式传 `self.name_parser`（只 name）。两个解析器共用同一套
+    /// 分词/合取配置，换掉它只改变词打到哪些字段上。
+    fn build_queries(
+        &self,
+        query_str: &str,
+        parser: &QueryParser,
+        field: SearchField,
+    ) -> Result<(Box<dyn Query>, Box<dyn Query>)> {
         let parsed = query::parse(query_str)?;
         if !parsed.has_operators {
             if let Some(parts) = plain_typeahead_parts(query_str) {
                 let prefix_last = !query_str.chars().last().is_some_and(char::is_whitespace);
-                return self.build_typeahead_queries(query_str, &parts, prefix_last);
+                return self.build_typeahead_queries(query_str, &parts, prefix_last, parser, field);
             }
             return Ok((
-                self.parser.parse_query(query_str)?,
-                self.parser.parse_query(query_str)?,
+                parser.parse_query(query_str)?,
+                parser.parse_query(query_str)?,
             ));
         }
-        self.build_from_parsed(&parsed)
+        self.build_from_parsed(&parsed, parser)
     }
 
     /// 普通输入走独立 autocomplete 召回通道：每个 CJK 连续段是逐字短语，普通词的
@@ -582,6 +890,8 @@ impl Searcher {
         query_str: &str,
         parts: &[TypeaheadPart],
         prefix_last: bool,
+        parser: &QueryParser,
+        field: SearchField,
     ) -> Result<(Box<dyn Query>, Box<dyn Query>)> {
         let last = parts.len() - 1;
         let mut recall = Vec::with_capacity(parts.len());
@@ -605,18 +915,27 @@ impl Searcher {
                     term_query(self.fields.content, word),
                 ),
             };
-            recall.push((
-                Occur::Must,
-                Box::new(BooleanQuery::new(vec![
+            // 文件名模式下只保留 name 那一半。recall 里若还挂着 content 的 Should
+            // 分支，"只查文件名"就退化成"两个字段任一命中"——这条路径不走
+            // QueryParser，光换 parser 是拦不住的，必须在这里显式收窄。
+            let recall_clauses = match field {
+                SearchField::Content => vec![
                     (Occur::Should, name_query),
                     (Occur::Should, content_query),
-                ])) as Box<dyn Query>,
+                ],
+                SearchField::Name => vec![(Occur::Should, name_query)],
+            };
+            recall.push((
+                Occur::Must,
+                Box::new(BooleanQuery::new(recall_clauses)) as Box<dyn Query>,
             ));
+            // 高亮查询始终打在正文上：即使用户按文件名搜到了文件，点开预览时
+            // 正文里出现该词的地方也该标出来。
             snippet.push((Occur::Must, snippet_query));
         }
 
         let stable_recall = Box::new(BooleanQuery::new(recall)) as Box<dyn Query>;
-        let relevance_boost = BoostQuery::new(self.parser.parse_query(query_str)?, 2.0);
+        let relevance_boost = BoostQuery::new(parser.parse_query(query_str)?, 2.0);
         Ok((
             Box::new(BooleanQuery::new(vec![
                 (Occur::Must, stable_recall),
@@ -635,6 +954,7 @@ impl Searcher {
     fn build_from_parsed(
         &self,
         parsed: &query::Parsed,
+        parser: &QueryParser,
     ) -> Result<(Box<dyn Query>, Box<dyn Query>)> {
         let mut group_queries: Vec<Box<dyn Query>> = Vec::new();
         // 所有组的正内容词并集，只给高亮用。
@@ -644,13 +964,14 @@ impl Searcher {
             let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
             for term in &group.content {
-                // 内容词原样交给主 QueryParser（同时查 name+content，短语/子词都由它处理）。
-                clauses.push((Occur::Must, self.parser.parse_query(term)?));
+                // 内容词原样交给指定的 parser（内容模式同时查 name+content，
+                // 文件名模式只查 name；短语/子词都交给 QueryParser 处理）。
+                clauses.push((Occur::Must, parser.parse_query(term)?));
                 // 再解析一份进高亮集合——Box<dyn Query> 不能克隆，只能重解析一次。
-                content_only.push((Occur::Should, self.parser.parse_query(term)?));
+                content_only.push((Occur::Should, parser.parse_query(term)?));
             }
             for term in &group.excluded {
-                clauses.push((Occur::MustNot, self.parser.parse_query(term)?));
+                clauses.push((Occur::MustNot, parser.parse_query(term)?));
             }
             for path in &group.paths {
                 clauses.push((Occur::Must, self.build_path_query(path)?));
@@ -730,6 +1051,57 @@ impl Searcher {
         Ok(Box::new(BooleanQuery::new(clauses)))
     }
 
+    /// 把"只在某个索引根下搜"翻译成 path 字段上的**前缀范围**查询。
+    ///
+    /// 根路径的写法差异（正斜杠 / 结尾分隔符 / 有无 `\\?\` 前缀）交给
+    /// [`scope_root_variants`] 归一化，这里只管把每种形态翻译成子树查询。
+    ///
+    /// 刻意不用 `path:` 操作符那套分词子词 AND（见 [`Self::build_path_query`]）：
+    /// 那是把路径切成 token 各自匹配再合取，选了"范围 = D:\Docs"会把
+    /// `D:\Other\Docs` 也捞进来——筛选等于没生效。这里在 path 字段（STRING，
+    /// 整条路径一个 term）上按前缀扫 term 字典，语义才是真正的"路径以此开头"。
+    fn build_root_query(&self, root: &str) -> Option<Box<dyn Query>> {
+        let variants = scope_root_variants(root);
+        // 空串 / 纯分隔符说明调用方没真的给范围，退回"不限"，不要生成一个永远
+        // 匹配不到的查询把结果全过滤掉。
+        if variants.is_empty() {
+            return None;
+        }
+        let clauses: Vec<(Occur, Box<dyn Query>)> = variants
+            .into_iter()
+            .map(|root| (Occur::Should, self.path_subtree_query(&root)))
+            .collect();
+        Some(Box::new(BooleanQuery::new(clauses)))
+    }
+
+    /// "root 这一条 ∪ root 下的子树"：精确项 OR 前缀区间。
+    ///
+    /// **前缀必须补上路径分隔符**——否则"范围 = D:\Docs"会把 `D:\DocsOther\...`
+    /// 也捞进来，同前缀的兄弟目录被误伤。这里跟 `count_under`、
+    /// `updater.rs::delete_tree` 用同一套思路，刻意保持口径一致：否则会出现
+    /// "托盘显示这个根 2 篇、界面筛出来 3 篇"这种两处对不上的现象。
+    fn path_subtree_query(&self, root: &str) -> Box<dyn Query> {
+        let mut prefix = root.to_string();
+        if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
+            prefix.push(std::path::MAIN_SEPARATOR);
+        }
+        // 上界追加两个 U+10FFFF（它的 UTF-8 首字节 0xF4 是合法 UTF-8 里最大的
+        // 首字节），取 Excluded，既盖住子树里的全部路径也不排掉 root 自身。
+        let upper = format!("{prefix}\u{10FFFF}\u{10FFFF}");
+        let exact = TermQuery::new(
+            Term::from_field_text(self.fields.path, root),
+            IndexRecordOption::Basic,
+        );
+        let subtree = RangeQuery::new(
+            Bound::Included(Term::from_field_text(self.fields.path, &prefix)),
+            Bound::Excluded(Term::from_field_text(self.fields.path, &upper)),
+        );
+        Box::new(BooleanQuery::new(vec![
+            (Occur::Should, Box::new(exact) as Box<dyn Query>),
+            (Occur::Should, Box::new(subtree) as Box<dyn Query>),
+        ]))
+    }
+
     /// 把一条 `mtime:` 过滤拼成 mtime 字段上的 [`RangeQuery`]。mtime 是 i64 FAST 字段，
     /// tantivy 0.26 的 RangeQuery 直接走 fast field 扫描，不需要额外索引属性。
     /// 日期已在 [`query`] 层归约成"当天/次日 0 点"两个毫秒边界，这里只按比较符
@@ -805,7 +1177,15 @@ impl Searcher {
     /// 不可变、读写可跨进程共存，但 reader 不会自己感知到别的进程提交了新段。
     /// 调用方（MCP 工具处理函数）应在每次请求前调用一次，保证读到浮窗侧最新的索引状态。
     pub fn reload(&self) -> Result<()> {
-        self.reader.reload().context("索引 reader 重载失败")
+        self.reader.reload().context("索引 reader 重载失败")?;
+        // 快照换了，缓存必须整体作废——这是缓存唯一的失效点。放在 reload 里
+        // 保证"换了快照就一定清空"，不会漏掉某条路径返回旧正文。
+        let mut cache = self
+            .content_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.clear();
+        Ok(())
     }
 
     /// 按精确路径分块读取已索引正文。
@@ -821,22 +1201,11 @@ impl Searcher {
         if max_chars == 0 {
             bail!("max_chars 必须大于 0");
         }
-        let searcher = self.reader.searcher();
-        let path_query = TermQuery::new(
-            Term::from_field_text(self.fields.path, path),
-            IndexRecordOption::Basic,
-        );
-        let docs = searcher.search(&path_query, &TopDocs::with_limit(1).order_by_score())?;
-        let Some((_, addr)) = docs.into_iter().next() else {
+        let Some(doc) = self.cached_doc(path)? else {
             return Ok(None);
         };
-
-        let doc: TantivyDocument = searcher.doc(addr)?;
-        let content = doc
-            .get_first(self.fields.content)
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let mut chars = content.chars().skip(offset_chars);
+        let total_chars = doc.total_chars;
+        let mut chars = doc.content.chars().skip(offset_chars);
         let chunk: String = chars.by_ref().take(max_chars).collect();
         let returned_chars = chunk.chars().count();
         let end = offset_chars.saturating_add(returned_chars);
@@ -847,6 +1216,144 @@ impl Searcher {
             offset_chars,
             returned_chars,
             next_offset_chars: has_more.then_some(end),
+            total_chars,
+        }))
+    }
+
+    /// 取一篇文档的已索引正文，优先命中缓存。
+    ///
+    /// 命中时**完全不碰 Tantivy 文档存储**——翻长文的第 2、3…块时，这就是省掉的
+    /// 主要开销（原来每读一块都要把整篇正文取出来再解压一遍）。快照变化或
+    /// 显式 reload 时清空缓存，自动重载同样不会返回旧正文。
+    fn cached_doc(&self, path: &str) -> Result<Option<CachedDoc>> {
+        let snapshot = self.reader.searcher();
+        let snapshot_generation = snapshot.generation().generation_id();
+        // 命中/未命中这一段要在锁里做，顺便记下当前快照代号，然后**释放锁**再去读
+        // 索引——读索引要走 Tantivy 文档存储，不该压着锁做。回填时再比对代号，
+        // 期间有人 reload 过就放弃这次回填（详见 ContentCache 的文档）。
+        let generation = {
+            // 锁被毒化（上一个持锁线程 panic）时照旧取内部数据：缓存脏了最多是
+            // 多读一次索引，不该让整个搜索线程跟着崩。
+            let mut cache = self
+                .content_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if cache.snapshot_generation != Some(snapshot_generation) {
+                cache.clear();
+                cache.snapshot_generation = Some(snapshot_generation);
+            }
+            if let Some(doc) = cache.get(path) {
+                return Ok(Some(doc));
+            }
+            cache.generation
+        };
+        let Some(content) = self.stored_content_in(&snapshot, path)? else {
+            return Ok(None);
+        };
+        let total_chars = content.chars().count();
+        let doc = CachedDoc {
+            content: Arc::from(content.as_str()),
+            total_chars,
+        };
+        let mut cache = self
+            .content_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // 代号对不上说明这中间换过快照：手里这篇是旧的，写进去会让这篇文档一直
+        // 返回过期正文，宁可不缓存。
+        if cache.generation == generation {
+            cache.put(path.to_string(), doc.clone());
+        }
+        Ok(Some(doc))
+    }
+
+    /// 按路径取该文档已索引的整篇正文（私有辅助，供 [`Self::cached_doc`]
+    /// 和 [`find_in_document`](Self::find_in_document) 共用同一次按路径取文档
+    /// 的查询逻辑）。路径不在索引里时返回 `None`。
+    fn stored_content(&self, path: &str) -> Result<Option<String>> {
+        let searcher = self.reader.searcher();
+        self.stored_content_in(&searcher, path)
+    }
+
+    fn stored_content_in(&self, searcher: &tantivy::Searcher, path: &str) -> Result<Option<String>> {
+        let path_query = TermQuery::new(
+            Term::from_field_text(self.fields.path, path),
+            IndexRecordOption::Basic,
+        );
+        let docs = searcher.search(&path_query, &TopDocs::with_limit(1).order_by_score())?;
+        let Some((_, addr)) = docs.into_iter().next() else {
+            return Ok(None);
+        };
+        let doc: TantivyDocument = searcher.doc(addr)?;
+        Ok(Some(
+            doc.get_first(self.fields.content)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+        ))
+    }
+
+    /// 文内字面查找：在指定文档的**已索引全文**上找 `needle` 的所有出现。
+    ///
+    /// 语义约定（自用版全文阅读的"文内查找"）：
+    /// - 纯字面匹配，`needle` 里的正则符号（`. * + ? ( ) [ ]` 等）一律当普通
+    ///   文字处理，不编译成任何模式；
+    /// - 默认忽略**英文**大小写（ASCII 折叠），中文/emoji 不受影响；
+    /// - 命中区间按 Unicode 字符坐标返回（见 [`FindInDocResult`]），跟
+    ///   [`read_indexed_content_chunk`](Self::read_indexed_content_chunk) 的分块
+    ///   坐标同一口径，调用方可以拿命中起点直接定位到对应正文块；
+    /// - 全文一次性在字符数组上扫描，不存在分块边界，跨块关键词天然不漏；
+    ///   贪心推进保证区间互不重叠、无重复计数；
+    /// - 路径不在索引里时返回 `None`；`needle` 为空返回空命中列表。
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn main() -> anyhow::Result<()> {
+    /// use std::path::Path;
+    /// use dowse::Searcher;
+    ///
+    /// let searcher = Searcher::open(Path::new("./my-index"))?;
+    /// if let Some(result) = searcher.find_in_document("D:\\docs\\note.md", "限流")? {
+    ///     println!("全文 {} 字，命中 {} 处", result.total_chars, result.matches.len());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn find_in_document(&self, path: &str, needle: &str) -> Result<Option<FindInDocResult>> {
+        let Some(content) = self.stored_content(path)? else {
+            return Ok(None);
+        };
+        let total_chars = content.chars().count();
+        if needle.is_empty() {
+            return Ok(Some(FindInDocResult {
+                matches: Vec::new(),
+                total_chars,
+            }));
+        }
+
+        // 把全文和查找词都折成"ASCII 小写化"的字符数组再逐位比对：大小写不敏感
+        // 只对英文字母生效，其它字符（中文/emoji/符号）原样保留，跟前端展示层
+        // 的大小写折叠语义一致。
+        let needle_folded: Vec<char> = needle.chars().map(fold_ascii_case).collect();
+        let haystack: Vec<char> = content.chars().map(fold_ascii_case).collect();
+
+        let n = needle_folded.len();
+        let mut matches = Vec::new();
+        let mut i = 0usize;
+        while i + n <= haystack.len() {
+            if haystack[i..i + n] == needle_folded[..] {
+                matches.push(i..i + n);
+                // 贪心推进到命中末尾：同一处文本不被重复计数（"aaa" 查 "aa"
+                // 只记 1 次），相邻命中区间天然互不重叠。
+                i += n;
+            } else {
+                i += 1;
+            }
+        }
+        Ok(Some(FindInDocResult {
+            matches,
+            total_chars,
         }))
     }
 
@@ -886,7 +1393,10 @@ impl Searcher {
         // 让预览查询词里若带了 path:/mtime:/size: 等操作符时不会把预览搞挂——操作符
         // 交给搜索层过滤即可，预览只关心"高亮哪些词"。普通输入下这份对应正文侧的
         // autocomplete 召回条件。
-        let (_retrieval, content_query) = self.build_queries(query_str)?;
+        // 预览高亮只认正文那份查询——这里固定用内容解析器：即使搜索时选了
+        // "模式=文件名"，预览里也该把正文中的命中词标出来（用户点开文件就是要看正文）。
+        let (_retrieval, content_query) =
+            self.build_queries(query_str, &self.parser, SearchField::Content)?;
         let combined = BooleanQuery::new(vec![
             (Occur::Must, Box::new(path_query.clone()) as Box<dyn Query>),
             (Occur::Must, content_query),
@@ -909,13 +1419,14 @@ impl Searcher {
                 }
                 None => snippet_with_fallback(&snippet_gen, content, PREVIEW_MAX_CHARS),
             };
-            let (size, mtime, ext) = self.doc_meta(&doc);
+            let (size, mtime, ext, kind) = self.doc_meta(&doc);
             return Ok(Some(PreviewHit {
                 snippet,
                 highlighted,
                 size,
                 mtime,
                 ext,
+                kind,
             }));
         }
 
@@ -931,18 +1442,19 @@ impl Searcher {
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         let window: String = content.chars().take(PREVIEW_MAX_CHARS).collect();
-        let (size, mtime, ext) = self.doc_meta(&doc);
+        let (size, mtime, ext, kind) = self.doc_meta(&doc);
         Ok(Some(PreviewHit {
             snippet: window,
             highlighted: vec![],
             size,
             mtime,
             ext,
+            kind,
         }))
     }
 
-    /// 从命中文档里取 (size, mtime, ext) 三元组，preview() 的两条分支共用。
-    fn doc_meta(&self, doc: &TantivyDocument) -> (u64, i64, String) {
+    /// 从命中文档里取 (size, mtime, ext, kind) 四元组，preview() 的两条分支共用。
+    fn doc_meta(&self, doc: &TantivyDocument) -> (u64, i64, String, String) {
         let size = doc
             .get_first(self.fields.size)
             .and_then(|v| v.as_u64())
@@ -956,7 +1468,24 @@ impl Searcher {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_owned();
-        (size, mtime, ext)
+        let kind = doc
+            .get_first(self.fields.kind)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        (size, mtime, ext, kind)
+    }
+}
+
+/// 文内查找的大小写折叠：只把 ASCII 大写字母折成小写，其余字符（中文、emoji、
+/// 符号）原样保留。刻意不做完整 Unicode case folding——一是全量折叠会让某些
+/// 字符折叠成一串（如 `İ`），字符坐标会对不上；二是自用场景关心的就是
+/// "英文大小写不敏感、中文原样匹配"这一条。
+fn fold_ascii_case(c: char) -> char {
+    if c.is_ascii_uppercase() {
+        c.to_ascii_lowercase()
+    } else {
+        c
     }
 }
 
@@ -1073,6 +1602,29 @@ mod tests {
     use super::*;
     use tantivy::doc;
 
+    /// 取索引里记录的某篇文档的**精确路径**：先用 `path:` 操作符查一次，再从命中里
+    /// 按文件名后缀挑出目标。
+    ///
+    /// **不要用 `std::fs::canonicalize` 自己拼这个路径。** Windows 上
+    /// `canonicalize` 会把路径规整成长名 + `\\?\` 前缀的 verbatim 形式，而
+    /// `tempfile` 的根目录本身可能还是 `TEMP` 的 8.3 短名——两侧拼法不一致，
+    /// 拼出来的字符串跟索引里 `path` 字段存的那串对不上，按路径精确查询就会
+    /// 一路返回 `None`（`preview` / `read_indexed_content_chunk` /
+    /// `find_in_document` 全查不到文档）。索引里的 path 就是建索引时枚举目录
+    /// 得到的原样值，从查询结果里取才和它同一口径。
+    fn indexed_path(searcher: &Searcher, file_name: &str) -> String {
+        // 查询操作数用不带扩展名的词干：`path:` 的解析器对带点的操作数处理起来
+        // 更绕，而词干已经能唯一定位到这篇文档，后缀过滤那一步再卡死全名。
+        let stem = file_name.split('.').next().unwrap_or(file_name);
+        let hits = searcher
+            .search(&format!("path:{stem}"), 20)
+            .expect("按文件名查索引应成功");
+        hits.into_iter()
+            .find(|h| h.path.ends_with(file_name))
+            .unwrap_or_else(|| panic!("索引里应按文件名找到 {file_name}"))
+            .path
+    }
+
     #[test]
     fn plain_typeahead_plan_is_deterministic_across_scripts() {
         assert_eq!(
@@ -1147,6 +1699,254 @@ mod tests {
                 assert!(r.end <= hit.snippet.len());
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn find_in_document_uses_unicode_char_coordinates_not_bytes_or_utf16() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        let target_dir = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
+
+        // 头部放一个 emoji（1 个 Unicode 字符 = 4 个 UTF-8 字节 = 2 个 UTF-16 单元），
+        // 后面紧跟 ASCII：三者坐标完全不同，正好用来钉死"按 Unicode 字符计数"。
+        std::fs::write(
+            target_dir.path().join("emoji.md"),
+            "😀abc中文内容",
+        )?;
+        crate::rebuild_index(index_dir.path(), target_dir.path())?;
+        let searcher = Searcher::open(index_dir.path())?;
+
+        let path = indexed_path(&searcher, "emoji.md");
+        let found = searcher
+            .find_in_document(&path, "abc")?
+            .expect("文档应在索引里");
+        // "😀" 是第 0 个字符，"abc" 从第 1 个字符开始；若按字节算是 4，按 UTF-16 算是 2。
+        assert_eq!(found.matches, vec![1..4], "命中应按 Unicode 字符坐标");
+        assert_eq!(found.total_chars, 8, "总字符数：😀 + abc + 中文内容");
+
+        // 中文命中同样走字符坐标（"中文内容" 从第 4 个字符开始）。
+        let cn = searcher
+            .find_in_document(&path, "内容")?
+            .expect("文档应在索引里");
+        assert_eq!(cn.matches, vec![6..8]);
+
+        // emoji 自身也能被查到（折叠不改变它）。
+        let emoji = searcher
+            .find_in_document(&path, "😀")?
+            .expect("文档应在索引里");
+        assert_eq!(emoji.matches, vec![0..1]);
+        Ok(())
+    }
+
+    #[test]
+    fn find_in_document_is_literal_and_ascii_case_insensitive() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        let target_dir = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
+
+        // 正文里含正则元字符和大小写混排的英文。
+        std::fs::write(
+            target_dir.path().join("literal.md"),
+            "限流器 Rate-Limiter 配置 a.b*c (v2) 结束",
+        )?;
+        crate::rebuild_index(index_dir.path(), target_dir.path())?;
+        let searcher = Searcher::open(index_dir.path())?;
+        let path = indexed_path(&searcher, "literal.md");
+
+        // 英文大小写不敏感。
+        let upper = searcher.find_in_document(&path, "RATE-LIMITER")?.unwrap();
+        assert_eq!(upper.matches.len(), 1, "大写查询应命中: {upper:?}");
+        let lower = searcher.find_in_document(&path, "rate-limiter")?.unwrap();
+        assert_eq!(lower.matches, upper.matches, "大小写不应改变命中位置");
+
+        // 正则元字符按普通文字处理：`a.b` 只匹配字面的 a.b，不把 "." 当通配。
+        let literal_dot = searcher.find_in_document(&path, "a.b")?.unwrap();
+        assert_eq!(literal_dot.matches.len(), 1, "a.b 应按字面命中一次");
+        let wildcard_lookalike = searcher.find_in_document(&path, "aXb")?.unwrap();
+        assert!(
+            wildcard_lookalike.matches.is_empty(),
+            "aXb 不应命中：查找词里的 \".\" 只能按字面匹配，不能当通配符"
+        );
+
+        // 中文按字面匹配，大小写折叠不影响它。
+        let cn = searcher.find_in_document(&path, "限流器")?.unwrap();
+        assert_eq!(cn.matches.len(), 1);
+
+        // 不存在的词返回空列表，不是错误。
+        let none = searcher.find_in_document(&path, "不存在的词")?.unwrap();
+        assert!(none.matches.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn find_in_document_greedy_matches_are_non_overlapping_and_deduped() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        let target_dir = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
+
+        std::fs::write(target_dir.path().join("overlap.md"), "aaaa")?;
+        crate::rebuild_index(index_dir.path(), target_dir.path())?;
+        let searcher = Searcher::open(index_dir.path())?;
+        let path = indexed_path(&searcher, "overlap.md");
+
+        let result = searcher.find_in_document(&path, "aa")?.unwrap();
+        assert_eq!(
+            result.matches,
+            vec![0..2, 2..4],
+            "aaaa 查 aa 应得两个不重叠命中，不做重叠计数"
+        );
+        // 区间有序且互不重叠
+        for w in result.matches.windows(2) {
+            assert!(w[0].end <= w[1].start);
+        }
+
+        // 空查找词返回空命中列表（不算错误）。
+        let empty = searcher.find_in_document(&path, "")?.unwrap();
+        assert!(empty.matches.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn find_in_document_finds_keyword_spanning_chunk_boundary() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        let target_dir = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
+
+        // 造一段长正文，让哨兵词正好跨在分块边界上：分块大小取 100 字符，
+        // 词从第 97 个字符开始（占 6 个字符），横跨第 0 块和第 1 块。
+        let head: String = "字".repeat(97);
+        let content = format!("{head}跨块哨兵词{}", "尾".repeat(200));
+        std::fs::write(target_dir.path().join("long.md"), &content)?;
+        crate::rebuild_index(index_dir.path(), target_dir.path())?;
+        let searcher = Searcher::open(index_dir.path())?;
+        let path = indexed_path(&searcher, "long.md");
+
+        let needle = "跨块哨兵词";
+        let found = searcher.find_in_document(&path, needle)?.unwrap();
+        assert_eq!(found.matches.len(), 1, "跨块关键词必须被找到: {found:?}");
+        let hit = found.matches[0].clone();
+        assert_eq!(hit.start, 97);
+
+        // 按命中起点定位正文块。这里要钉住的是**前端分块阅读的契约**：命中可能
+        // 横跨两个块（块边界正好落在词中间），只看起点所在块会把词尾截掉，必须
+        // 把命中覆盖到的块都补齐、拼起来才是完整的关键词。
+        const CHUNK: usize = 100;
+        let first_offset = (hit.start / CHUNK) * CHUNK;
+
+        let first_chunk = searcher
+            .read_indexed_content_chunk(&path, first_offset, CHUNK)?
+            .expect("文档应在索引里");
+        assert!(
+            !first_chunk.content.contains(needle),
+            "用例前提：命中应横跨块边界，起点所在块不该已含完整关键词（否则这条用例没测到跨块）: {:?}",
+            first_chunk.content
+        );
+
+        let mut combined = String::new();
+        let mut offset = first_offset;
+        let total_chars = first_chunk.total_chars;
+        let mut chunk = first_chunk;
+        loop {
+            combined.push_str(&chunk.content);
+            let covered_to = offset + chunk.returned_chars;
+            match chunk.next_offset_chars {
+                // 还没读到命中的结尾，接着读下一块。
+                Some(next) if covered_to < hit.end => offset = next,
+                _ => break,
+            }
+            chunk = searcher
+                .read_indexed_content_chunk(&path, offset, CHUNK)?
+                .expect("文档应在索引里");
+        }
+        assert!(
+            combined.contains(needle),
+            "覆盖命中所需的所有块拼起来必须含完整关键词（跨块不漏词）: {combined:?}"
+        );
+        assert_eq!(total_chars, found.total_chars, "两条读取路径的总字符数应一致");
+        Ok(())
+    }
+
+    #[test]
+    fn find_in_document_returns_none_for_unknown_path() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        let target_dir = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
+        std::fs::write(target_dir.path().join("known.md"), "内容")?;
+        crate::rebuild_index(index_dir.path(), target_dir.path())?;
+        let searcher = Searcher::open(index_dir.path())?;
+
+        assert!(
+            searcher
+                .find_in_document("C:\\not\\in\\index.md", "内容")?
+                .is_none(),
+            "路径不在索引里时应返回 None"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_indexed_content_chunk_reports_totals_and_end_of_document() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        let target_dir = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
+        std::fs::write(target_dir.path().join("doc.md"), "0123456789")?;
+        crate::rebuild_index(index_dir.path(), target_dir.path())?;
+        let searcher = Searcher::open(index_dir.path())?;
+        let path = indexed_path(&searcher, "doc.md");
+
+        let first = searcher
+            .read_indexed_content_chunk(&path, 0, 4)?
+            .expect("文档应在索引里");
+        assert_eq!(first.content, "0123");
+        assert_eq!(first.returned_chars, 4);
+        assert_eq!(first.next_offset_chars, Some(4), "还有内容");
+        assert_eq!(first.total_chars, 10);
+
+        let last = searcher
+            .read_indexed_content_chunk(&path, 8, 4)?
+            .expect("文档应在索引里");
+        assert_eq!(last.content, "89");
+        assert_eq!(last.returned_chars, 2);
+        assert_eq!(last.next_offset_chars, None, "末页应明确告知没有下一页");
+        assert_eq!(last.total_chars, 10);
+
+        // 越界读取返回空末页，不是错误。
+        let beyond = searcher
+            .read_indexed_content_chunk(&path, 100, 4)?
+            .expect("文档应在索引里");
+        assert!(beyond.content.is_empty());
+        assert_eq!(beyond.next_offset_chars, None);
+        Ok(())
+    }
+
+    #[test]
+    fn corrupted_docx_is_indexed_as_status_placeholder_searchable_by_name() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        let target_dir = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
+
+        // 一个损坏的 docx：抽取失败，但应落成 err:corrupted 占位文档——
+        // 按文件名能搜到，预览能给出明确状态。
+        std::fs::write(
+            target_dir.path().join("损坏的季报.docx"),
+            b"not a zip at all",
+        )?;
+        std::fs::write(target_dir.path().join("normal.md"), "正常内容")?;
+        crate::rebuild_index(index_dir.path(), target_dir.path())?;
+        let searcher = Searcher::open(index_dir.path())?;
+
+        let hits = searcher.search("损坏的季报", 10)?;
+        let path = hits
+            .iter()
+            .find(|h| h.path.ends_with("损坏的季报.docx"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "抽取失败的文件仍应能按文件名搜到: {:?}",
+                    hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+                )
+            })
+            .path
+            .clone();
+
+        let preview = searcher
+            .preview(&path, "损坏的季报")?
+            .expect("占位文档应有预览结果");
+        assert_eq!(preview.kind, "err:corrupted", "预览应带上明确的失败状态");
+        assert_eq!(preview.snippet, "", "占位文档没有正文");
         Ok(())
     }
 
@@ -1345,9 +2145,13 @@ mod tests {
 
         let mut parser = QueryParser::for_index(&index, vec![fields.name, fields.content]);
         parser.set_conjunction_by_default();
+        let mut name_parser = QueryParser::for_index(&index, vec![fields.name]);
+        name_parser.set_conjunction_by_default();
         let searcher = Searcher {
             reader: index.reader()?,
             parser,
+            name_parser,
+            content_cache: Mutex::new(ContentCache::default()),
             fields,
         };
 
@@ -1687,6 +2491,394 @@ mod tests {
 
         std::fs::remove_dir_all(&sibling_named_with_shared_prefix).ok();
         Ok(())
+    }
+
+    /// 界面"范围"下拉选某个根时，同前缀的**兄弟目录**不能被捞进来。
+    ///
+    /// `docs` 是 `docs-other` 的字符串前缀——如果范围查询退化成裸前缀匹配，
+    /// 这里就会从 2 条变成 3 条。这条锁住"前缀必须补路径分隔符"这个细节，
+    /// 也保证跟 `count_under` 口径一致（否则会出现"托盘显示 2 篇、筛出 3 篇"）。
+    #[test]
+    fn search_scoped_root_excludes_sibling_with_shared_prefix() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        let parent = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
+        let target = parent.path().join("docs");
+        let sibling = parent.path().join("docs-other");
+        std::fs::create_dir_all(&target)?;
+        std::fs::create_dir_all(&sibling)?;
+
+        std::fs::write(target.join("a.md"), "共同关键词")?;
+        std::fs::write(target.join("b.md"), "共同关键词")?;
+        std::fs::write(sibling.join("c.md"), "共同关键词")?;
+
+        crate::rebuild_index(index_dir.path(), parent.path())?;
+        let searcher = Searcher::open(index_dir.path())?;
+
+        let all = searcher.search_scoped(
+            "共同关键词",
+            20,
+            0,
+            None,
+            SortMode::Relevance,
+            None,
+            SearchField::Content,
+        )?;
+        assert_eq!(all.total, 3, "不限范围时应命中全部 3 篇");
+
+        let target_str = target.to_string_lossy().into_owned();
+        let scoped = searcher.search_scoped(
+            "共同关键词",
+            20,
+            0,
+            None,
+            SortMode::Relevance,
+            Some(&target_str),
+            SearchField::Content,
+        )?;
+        assert_eq!(
+            scoped.total, 2,
+            "范围 = docs 时不能把 docs-other 也算进来（前缀漏了分隔符？）"
+        );
+        for hit in &scoped.hits {
+            assert!(
+                hit.path.contains("docs"),
+                "命中 {} 不在选定的根下",
+                hit.path
+            );
+            assert!(
+                !hit.path.contains("docs-other"),
+                "命中 {} 来自兄弟目录，范围过滤没生效",
+                hit.path
+            );
+        }
+        Ok(())
+    }
+
+    /// 范围根路径的写法差异（正斜杠 / 结尾分隔符 / 有无 `\\?\` 前缀）必须都能归一，
+    /// 否则"选了范围却一条都搜不到"——比不过滤还糟。
+    #[test]
+    fn scope_root_variants_normalize_separators_and_verbatim_prefix() {
+        let v = scope_root_variants("C:/Users/me/Docs/");
+        assert!(
+            v.contains(&r"C:\Users\me\Docs".to_string()),
+            "正斜杠要归一成反斜杠、结尾分隔符要去掉，实际 {v:?}"
+        );
+        if cfg!(windows) {
+            assert!(
+                v.contains(&r"\\?\C:\Users\me\Docs".to_string()),
+                "要补一份 verbatim 形态，实际 {v:?}"
+            );
+        }
+    }
+
+    /// 已经是 verbatim 形态的输入要补一份剥掉前缀的版本（界面两边写法都可能出现）。
+    #[test]
+    fn scope_root_variants_cover_already_prefixed_input() {
+        let v = scope_root_variants(r"\\?\C:\Users\me\Docs");
+        assert!(v.contains(&r"\\?\C:\Users\me\Docs".to_string()));
+        if cfg!(windows) {
+            assert!(
+                v.contains(&r"C:\Users\me\Docs".to_string()),
+                "带前缀的输入要补一份剥掉前缀的形态，实际 {v:?}"
+            );
+        }
+    }
+
+    /// 空范围不能变成一个"永远匹配不到"的查询，必须退回"不限"。
+    #[test]
+    fn scope_root_variants_reject_empty() {
+        assert!(scope_root_variants("").is_empty());
+        assert!(scope_root_variants("   ").is_empty());
+        assert!(scope_root_variants("///").is_empty());
+    }
+
+    /// "模式 = 文件名"只按文件名检索：正文里的同名词不该把无关文档拉进结果。
+    #[test]
+    fn search_scoped_name_field_only_matches_filenames() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        let dir = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
+        // 文件名含"季度"、正文没有。
+        std::fs::write(dir.path().join("季度报告.md"), "这是一份普通说明文档")?;
+        // 正文含"季度"、文件名没有。
+        std::fs::write(dir.path().join("notes.md"), "季度营收情况汇总")?;
+
+        crate::rebuild_index(index_dir.path(), dir.path())?;
+        let searcher = Searcher::open(index_dir.path())?;
+
+        let content = searcher.search_scoped(
+            "季度",
+            20,
+            0,
+            None,
+            SortMode::Relevance,
+            None,
+            SearchField::Content,
+        )?;
+        assert_eq!(content.total, 2, "内容模式两篇都该命中");
+
+        let name = searcher.search_scoped(
+            "季度",
+            20,
+            0,
+            None,
+            SortMode::Relevance,
+            None,
+            SearchField::Name,
+        )?;
+        assert_eq!(name.total, 1, "文件名模式只该命中文件名含该词的那篇");
+        assert!(
+            name.hits[0].path.ends_with("季度报告.md"),
+            "命中的应是文件名含该词的文档，实际 {}",
+            name.hits[0].path
+        );
+        Ok(())
+    }
+
+    /// 正文缓存不能改变分块读取的语义：逐块读（第 2 块起命中缓存）拼起来
+    /// 必须等于一次读到的全文；`reload()` 清空缓存之后结果也必须一致——
+    /// 否则"缓存失效"这条就没真的生效。
+    #[test]
+    fn chunked_reads_are_identical_with_and_without_cache() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        let dir = tempfile::Builder::new().prefix("dowse-test-").tempdir()?;
+        // 远超一块（8000 字）的长度，强制走"第 1 块未命中 + 后续块命中缓存"。
+        let body: String = "中文段落标记".repeat(3000);
+        std::fs::write(dir.path().join("long.md"), &body)?;
+
+        crate::rebuild_index(index_dir.path(), dir.path())?;
+        let searcher = Searcher::open(index_dir.path())?;
+        let hits = searcher.search("中文段落标记", 10)?;
+        let path = hits[0].path.clone();
+
+        // 一次性读全文作为基准
+        let whole = searcher
+            .read_indexed_content_chunk(&path, 0, 100_000)?
+            .expect("文件应在索引里");
+        assert!(whole.content.chars().count() > 8000, "语料要真的超过一块");
+
+        // 逐块读（第二块起走缓存）
+        let mut stitched = String::new();
+        let mut offset = 0usize;
+        loop {
+            let chunk = searcher
+                .read_indexed_content_chunk(&path, offset, 8000)?
+                .expect("文件应在索引里");
+            stitched.push_str(&chunk.content);
+            match chunk.next_offset_chars {
+                Some(next) => offset = next,
+                None => {
+                    assert_eq!(
+                        stitched.chars().count(),
+                        chunk.total_chars,
+                        "拼起来的长度应等于全文字符数"
+                    );
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            stitched, whole.content,
+            "逐块读（命中缓存）拼起来必须等于一次读到的全文"
+        );
+
+        // reload 会清空缓存：清空后重读仍要一致，不能读到脏内容
+        searcher.reload()?;
+        let after = searcher
+            .read_indexed_content_chunk(&path, 0, 8000)?
+            .expect("reload 后仍应在索引里");
+        assert!(
+            whole.content.starts_with(&after.content),
+            "reload 后读到的第一块应与之前一致"
+        );
+        Ok(())
+    }
+
+    /// 缓存失效得是**真的**：真实改掉文件内容、增量提交、再 reload，缓存不能还
+    /// 攥着旧正文。只在内容不变时调 reload 的那种测试证明不了任何事——旧正文和
+    /// 新正文一样，怎么读都"通过"。
+    #[test]
+    fn cache_is_invalidated_after_real_content_change_and_reload() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        // 目录名不能带 "." 前缀，否则会被索引器当隐藏目录整棵跳过。
+        let dir = tempfile::Builder::new().prefix("dowse-upd-").tempdir()?;
+        let file = dir.path().join("note.md");
+        std::fs::write(&file, "最初的正文讲的是苹果")?;
+
+        crate::rebuild_index(index_dir.path(), dir.path())?;
+        let searcher = Searcher::open(index_dir.path())?;
+        let path = searcher.search("苹果", 10)?[0].path.clone();
+
+        let first = searcher
+            .read_indexed_content_chunk(&path, 0, 1000)?
+            .expect("文件应在索引里");
+        assert!(first.content.contains("苹果"), "第一次读到的是旧正文");
+
+        // 真的改内容 + 真的增量提交，而不是只调一下 reload。
+        std::fs::write(&file, "改过之后的正文讲的是香蕉")?;
+        let mut updater = crate::IndexUpdater::open(index_dir.path())?;
+        updater.apply(&[crate::PendingChange {
+            path: file.clone(),
+            op: crate::PendingOp::Upsert,
+        }])?;
+        drop(updater);
+
+        searcher.reload()?;
+        let second = searcher
+            .read_indexed_content_chunk(&path, 0, 1000)?
+            .expect("文件应还在索引里");
+        assert!(
+            second.content.contains("香蕉"),
+            "改内容并提交后 reload，缓存不能还返回旧正文，实际读到：{}",
+            second.content
+        );
+        assert!(!second.content.contains("苹果"), "旧正文必须已经失效");
+        Ok(())
+    }
+
+    #[test]
+    fn cache_is_invalidated_when_reader_reloads_without_wrapper() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        let dir = tempfile::Builder::new().prefix("dowse-auto-cache-").tempdir()?;
+        let file = dir.path().join("note.md");
+        std::fs::write(&file, "自动重载之前的苹果")?;
+        crate::rebuild_index(index_dir.path(), dir.path())?;
+        let searcher = Searcher::open(index_dir.path())?;
+        let path = searcher.search("苹果", 10)?[0].path.clone();
+        assert!(searcher.read_indexed_content_chunk(&path, 0, 1000)?.unwrap().content.contains("苹果"));
+
+        std::fs::write(&file, "自动重载之后的香蕉🧪")?;
+        let mut updater = crate::IndexUpdater::open(index_dir.path())?;
+        updater.apply(&[crate::PendingChange { path: file.clone(), op: crate::PendingOp::Upsert }])?;
+        // Bypass Searcher::reload, exactly as Tantivy's automatic reload does.
+        searcher.reader.reload()?;
+        let updated = searcher.read_indexed_content_chunk(&path, 0, 1000)?.unwrap();
+        assert!(updated.content.contains("香蕉🧪"));
+        assert!(!updated.content.contains("苹果"));
+
+        std::fs::remove_file(&file)?;
+        updater.apply(&[crate::PendingChange { path: file, op: crate::PendingOp::Remove }])?;
+        searcher.reader.reload()?;
+        assert!(searcher.read_indexed_content_chunk(&path, 0, 1000)?.is_none());
+        Ok(())
+    }
+
+    /// 文件被真实删除后 reload：缓存和索引都要同步变成"读不到"。
+    #[test]
+    fn cache_is_invalidated_after_real_delete_and_reload() -> Result<()> {
+        let index_dir = tempfile::tempdir()?;
+        let dir = tempfile::Builder::new().prefix("dowse-upd-").tempdir()?;
+        let file = dir.path().join("doomed.md");
+        std::fs::write(&file, "待删除文档独有词汇 zzqq")?;
+
+        crate::rebuild_index(index_dir.path(), dir.path())?;
+        let searcher = Searcher::open(index_dir.path())?;
+        let path = searcher.search("zzqq", 10)?[0].path.clone();
+        assert!(
+            searcher
+                .read_indexed_content_chunk(&path, 0, 1000)?
+                .is_some(),
+            "删除前应该读得到"
+        );
+
+        std::fs::remove_file(&file)?;
+        let mut updater = crate::IndexUpdater::open(index_dir.path())?;
+        updater.apply(&[crate::PendingChange {
+            path: file.clone(),
+            op: crate::PendingOp::Remove,
+        }])?;
+        drop(updater);
+
+        searcher.reload()?;
+        assert!(
+            searcher
+                .read_indexed_content_chunk(&path, 0, 1000)?
+                .is_none(),
+            "删除后 reload，缓存不能把已删文档的正文继续返回"
+        );
+        Ok(())
+    }
+
+    /// 反复 put 同一个 key，`order` 里不能堆重复条目——否则淘汰时空转，条目数
+    /// 和队列长度脱钩，内存压不住。
+    #[test]
+    fn cache_repeated_put_same_key_keeps_order_in_sync() {
+        let mut cache = ContentCache::default();
+        for i in 0..5 {
+            let content = format!("第 {} 版正文", i);
+            let total_chars = content.chars().count();
+            cache.put(
+                "same.md".to_string(),
+                CachedDoc {
+                    content: Arc::from(content.as_str()),
+                    total_chars,
+                },
+            );
+        }
+        assert_eq!(cache.map.len(), 1, "同一个 key 只该有一条");
+        assert_eq!(
+            cache.order.len(),
+            1,
+            "order 里不能堆同一 key 的副本，实际 {:?}",
+            cache.order
+        );
+        assert!(
+            cache.get("same.md").expect("应命中").content.contains("第 4 版"),
+            "应该读到最后一次写入的内容"
+        );
+    }
+
+    /// 光靠字节预算挡不住大量"几乎不占字节"的短文档：条目数上限必须单独生效。
+    #[test]
+    fn cache_entry_cap_bounds_tiny_documents() {
+        let mut cache = ContentCache::default();
+        // 每篇都是空正文（字节数 0），字节预算永远触发不了。
+        for i in 0..(CONTENT_CACHE_MAX_ENTRIES + 50) {
+            cache.put(
+                format!("tiny-{i}.md"),
+                CachedDoc {
+                    content: Arc::from(""),
+                    total_chars: 0,
+                },
+            );
+        }
+        assert!(
+            cache.map.len() <= CONTENT_CACHE_MAX_ENTRIES,
+            "条目数必须被上限压住，实际 {}",
+            cache.map.len()
+        );
+        assert_eq!(cache.order.len(), cache.map.len(), "order 与 map 必须同步");
+    }
+
+    /// `clear` 之后回填的旧快照内容要被代号挡掉，不能写进新快照的缓存里。
+    #[test]
+    fn cache_generation_blocks_stale_refill_after_clear() {
+        let mut cache = ContentCache::default();
+        cache.put(
+            "a.md".to_string(),
+            CachedDoc {
+                content: Arc::from("旧正文"),
+                total_chars: 3,
+            },
+        );
+        let gen_before = cache.generation;
+        cache.clear();
+        assert_ne!(cache.generation, gen_before, "clear 必须递增快照代号");
+        assert!(cache.map.is_empty());
+
+        // 模拟并发窗口：拿着 clear 之前记下的代号回来回填，应该被拒绝。
+        if cache.generation == gen_before {
+            cache.put(
+                "a.md".to_string(),
+                CachedDoc {
+                    content: Arc::from("旧正文"),
+                    total_chars: 3,
+                },
+            );
+        }
+        assert!(
+            cache.map.is_empty(),
+            "代号对不上时不能写入，否则这篇会一直返回过期正文"
+        );
     }
 
     #[test]

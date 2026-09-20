@@ -17,6 +17,10 @@ publish = false
 name = "dowse_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Standalone builds must embed the frontend instead of connecting to devUrl.
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

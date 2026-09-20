@@ -11,6 +11,7 @@
 		value,
 		defaultValue,
 		open,
+		menuAlign = 'right',
 		activeIndex = $bindable(0),
 		onselect,
 		ontoggle
@@ -20,6 +21,9 @@
 		value: string;
 		defaultValue: string;
 		open: boolean;
+		// 菜单对齐方式：右侧控件（类型/排序）默认右对齐；左侧控件（范围/模式/匹配）
+		// 传 'left'，否则长路径菜单会从左窄按钮向右伸出、被窗口左边裁掉。
+		menuAlign?: 'left' | 'right';
 		activeIndex?: number;
 		onselect: (value: string) => void;
 		ontoggle: () => void;
@@ -27,11 +31,12 @@
 
 	let isDefault = $derived(value === defaultValue);
 	let selectedLabel = $derived(options.find((o) => o.value === value)?.label ?? idleLabel);
+	let triggerTitle = $derived(isDefault ? idleLabel : selectedLabel);
 </script>
 
 <div class="dropdown">
 	<button type="button" class="trigger" class:marked={!isDefault} onclick={ontoggle}>
-		<span class="trigger-text">{isDefault ? idleLabel : selectedLabel}</span>
+		<span class="trigger-text" title={triggerTitle}>{isDefault ? idleLabel : selectedLabel}</span>
 		<svg class="chevron" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
 			<path
 				d="M2.5 4l2.5 2.5L7.5 4"
@@ -44,17 +49,18 @@
 		</svg>
 	</button>
 	{#if open}
-		<div class="menu" role="listbox">
+		<div class="menu" class:left={menuAlign === 'left'} role="listbox">
 			{#each options as opt, i (opt.value)}
 				<button
 					type="button"
 					class="item"
 					class:current={opt.value === value}
 					class:hovered={i === activeIndex}
+					title={opt.label}
 					onmouseenter={() => (activeIndex = i)}
 					onclick={() => onselect(opt.value)}
 				>
-					{opt.label}
+					<span class="item-label">{opt.label}</span>
 				</button>
 			{/each}
 		</div>
@@ -94,6 +100,9 @@
 
 	.trigger-text {
 		white-space: nowrap;
+		max-width: 220px;
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
 
 	.chevron {
@@ -107,6 +116,8 @@
 		right: 0;
 		z-index: 10;
 		min-width: 108px;
+		/* 视口限宽：长路径菜单不会伸出窗口被裁；桌面端封顶 340px。 */
+		max-width: min(340px, calc(100vw - 24px));
 		padding: 4px;
 		display: flex;
 		flex-direction: column;
@@ -115,6 +126,12 @@
 		border: 1px solid var(--panel-border);
 		border-radius: var(--radius-row);
 		box-shadow: var(--panel-shadow);
+	}
+
+	/* 左侧控件（范围/模式/匹配）菜单改为左对齐，避免从窄按钮向右溢出被窗口裁切。 */
+	.menu.left {
+		right: auto;
+		left: 0;
 	}
 
 	.item {
@@ -127,6 +144,13 @@
 		border-radius: 6px;
 		color: var(--fg-primary);
 		cursor: default;
+	}
+
+	.item-label {
+		display: block;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
 
 	.item.hovered {

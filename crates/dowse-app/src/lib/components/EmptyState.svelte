@@ -164,8 +164,8 @@
 
 	.sub {
 		margin: 0;
-		font-size: 12px;
-		color: var(--fg-tertiary);
+		font-size: 13px;
+		color: var(--fg-secondary);
 		max-width: 320px;
 		line-height: 1.6;
 	}
@@ -192,8 +192,8 @@
 
 	.count-unit {
 		margin: 0 0 4px;
-		font-size: 12px;
-		color: var(--fg-tertiary);
+		font-size: 13px;
+		color: var(--fg-secondary);
 	}
 
 	/* 固定高度的槽位：文件名一行流过时用 fade 进出，占位高度不随有无内容

@@ -13,7 +13,7 @@ use tantivy::{Index, IndexWriter, doc};
 use walkdir::WalkDir;
 
 use crate::cursor::{UsnCursor, VolumeKey};
-use crate::extract::{extract_text, is_extractable};
+use crate::extract::{ExtractFailure, ExtractOutcome, extract_text_detailed, is_extractable};
 use crate::meta::{IndexMeta, SCHEMA_VERSION, save_meta};
 use crate::ocr;
 use crate::ocr_queue::OcrQueue;
@@ -232,17 +232,27 @@ pub(crate) fn add_file_document(
         });
     }
 
-    let Some(content) = extract_text(path) else {
-        // 抽不出文本可能只是不支持的格式/损坏，也可能是本应可抽取但体积超限。
-        // 只对"本应可抽取的类型"再查一次体积，把超限跳过跟其它跳过区分开——
-        // 普通不可抽取类型（.exe 等）不做这次多余的 stat。
-        if is_extractable(path)
-            && let Some((_, size)) = file_stat(path)
-            && size > crate::rules::active_rules().max_file_bytes()
-        {
-            return Ok(AddOutcome::SkippedOversize);
+    let outcome = extract_text_detailed(path);
+    let content = match outcome {
+        ExtractOutcome::Text(content) => content,
+        ExtractOutcome::Failure(reason) => {
+            // 不在可抽取白名单里的类型（exe/dll 等）连占位都不写：写进索引
+            // 只会撑大索引、污染结果，用户也不会期待搜到一个 .dll 的"状态"。
+            // 旧版 Office（doc/xls/ppt）在白名单里，会落到下面的占位分支，
+            // 以 err:unsupported 的状态可被按文件名搜到。
+            if !is_extractable(path) {
+                return Ok(AddOutcome::Skipped);
+            }
+            // 本应可抽取但失败了：写占位文档（正文为空、kind 记失败原因）。
+            // 文件名仍可搜到，预览区能给出"不支持/加密/损坏/无可提取文字/
+            // 超过体积上限"的明确状态——不静默伪装成索引成功，也不无声消失。
+            let (mtime, size) = file_stat(path).unwrap_or((0, 0));
+            add_status_placeholder(writer, fields, path, mtime, size, reason)?;
+            return Ok(match reason {
+                ExtractFailure::Oversize => AddOutcome::SkippedOversize,
+                _ => AddOutcome::Skipped,
+            });
         }
-        return Ok(AddOutcome::Skipped);
     };
     let (mtime, size) = file_stat(path).unwrap_or((0, 0));
 
@@ -274,6 +284,51 @@ pub(crate) fn add_file_document(
         fields.content_prefixes => content,
     ))?;
     Ok(AddOutcome::Indexed)
+}
+
+/// 抽取失败的文件写一篇"状态占位文档"：正文为空（内容查询不会命中），但
+/// path/name/ext/mtime/size 齐全、kind 记失败原因（`err:` 短码，见
+/// [`crate::extract::ExtractFailure::kind_code`]）。这样用户按文件名仍能
+/// 搜到这个文件，预览区能显示明确状态（不支持/加密/损坏/无可提取文字/超限），
+/// 而不是文件无声消失、或被误以为索引成功。
+///
+/// 全量重建和增量更新（先删后加的 upsert）都经 [`add_file_document`] 走到
+/// 这里，占位文档和正常文档走同一套先删后加幂等逻辑，文件修好后重建/重扫
+/// 会自然替换成正常文档。
+fn add_status_placeholder(
+    writer: &IndexWriter,
+    fields: &Fields,
+    path: &Path,
+    mtime: i64,
+    size: u64,
+    reason: ExtractFailure,
+) -> Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let path_str = path.to_string_lossy().into_owned();
+    // 正文相关的字段统一给空串：占位文档不该被内容查询或前缀召回命中，
+    // 只有文件名/路径这一侧可搜。
+    writer.add_document(doc!(
+        fields.path => path_str.clone(),
+        fields.name => name.clone(),
+        fields.ext => ext,
+        fields.kind => reason.kind_code(),
+        fields.content => "",
+        fields.mtime => mtime,
+        fields.size => size,
+        fields.path_text => path_str,
+        fields.name_chars => name.clone(),
+        fields.content_chars => "",
+        fields.name_prefixes => name,
+        fields.content_prefixes => "",
+    ))?;
+    Ok(())
 }
 
 /// 图片文档：内容来自 OCR，可能是缓存命中的旧识别结果（全量重建索引时最常见），

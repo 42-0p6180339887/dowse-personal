@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use dowse::{DEFAULT_WORKERS, IndexUpdater, OcrPipeline, watch_roots_auto};
+use dowse::{DEFAULT_WORKERS, IndexUpdater, OcrPipeline, WatchProgress, watch_roots_auto};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::indexing_status::IndexingStatus;
@@ -107,9 +107,18 @@ fn watch_thread(app: AppHandle, index_dir: PathBuf, roots: Vec<PathBuf>, stop: A
         crate::logging::log_line("ocr", "未检测到可用的 OCR 语言包，OCR 管线已停用");
     }
 
-    // 挂实时监听，阻塞到 stop 置位。提交后 Searcher 的 reader 自动重载，
-    // 所以不用往前端推事件，搜索结果自然就追上了。
-    if let Err(err) = watch_roots_auto(&index_dir, &roots, updater, stop, |_progress| {}) {
+    // 实时监听，阻塞到 stop 置位。提交后 Searcher 的 reader 会自动重载（新数据已落盘），
+    // 但前端展示的是**上一次查询的快照**，不会自己重查——所以每提交一批就往窗口推一个
+    // `dowse://index-changed` 事件，由前端防抖合并后重跑当前查询、刷新索引统计（文档数/
+    // 占用）。窗口关着时事件自然丢弃，下次呼出会按快照补齐，不会丢更新、也不会触发全量扫描。
+    if let Err(err) = watch_roots_auto(&index_dir, &roots, updater, stop, {
+        let evt_app = app.clone();
+        move |progress| {
+            if matches!(progress, WatchProgress::Committed { .. } | WatchProgress::Reconciled) {
+                let _ = evt_app.emit("dowse://index-changed", ());
+            }
+        }
+    }) {
         crate::logging::log_line("watch", &format!("文件监听退出: {err}"));
     }
 

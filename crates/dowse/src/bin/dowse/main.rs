@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dowse::{
-    DEFAULT_WORKERS, IndexRules, IndexUpdater, OcrPipeline, Searcher, SortMode, WatchProgress,
-    display_path, drain_ocr_queue, index_root_incremental_with_progress, index_status, load_rules,
-    rebuild_index_with_progress, registered_roots, save_rules, watch_roots_auto,
+    DEFAULT_WORKERS, IndexRules, IndexUpdater, OcrPipeline, SearchField, Searcher, SortMode,
+    WatchProgress, display_path, drain_ocr_queue, index_root_incremental_with_progress,
+    index_status, load_rules, rebuild_index_with_progress, registered_roots, save_rules,
+    watch_roots_auto,
 };
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
@@ -48,9 +49,16 @@ enum Command {
         /// 只保留这些扩展名的结果（不含点，逗号分隔，如 md,pdf,txt）
         #[arg(long, value_delimiter = ',')]
         ext: Vec<String>,
-        /// 排序方式：relevance（默认）/ mtime_desc / mtime_asc / size_desc
+        /// 排序方式：relevance（默认）/ mtime_desc / mtime_asc / size_desc / size_asc
         #[arg(long)]
         sort: Option<String>,
+        /// 只搜某个索引根下的文件（路径前缀，如 D:\Docs）；不给表示不限范围。
+        /// 走路径前缀范围匹配，不是 path: 操作符那套分词子词 AND
+        #[arg(long)]
+        root: Option<String>,
+        /// 搜索模式：content（默认，查正文）/ name（只查文件名）
+        #[arg(long, default_value = "content")]
+        field: String,
     },
     /// 查看索引概况：位置、文档总数、落盘体积、已注册根目录、最近更新时间、当前规则
     Status,
@@ -90,7 +98,10 @@ enum RulesAction {
     },
 }
 
-/// 索引统一放在 %LOCALAPPDATA%\dowse\index，跟被索引的目录无关。
+/// 索引统一放在 %LOCALAPPDATA%\dowse-personal\index，跟被索引的目录无关。
+///
+/// 自用版用的是独立身份 `dowse-personal`（跟上游 `dowse` 分开），命令行和
+/// 自用版应用认的是同一份数据目录，两边建的索引可以互相直接用。
 ///
 /// `DOWSE_INDEX_DIR` 环境变量可以覆盖这个位置：集成测试（tests/mcp_integration.rs）
 /// 靠它把子进程指向一个临时索引，不碰用户机器上真的那份。这是只给测试/CI 基础设施
@@ -100,7 +111,7 @@ fn index_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("DOWSE_INDEX_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    let dirs = directories::ProjectDirs::from("", "", "dowse").context("拿不到用户数据目录")?;
+    let dirs = directories::ProjectDirs::from("", "", "dowse-personal").context("拿不到用户数据目录")?;
     Ok(dirs.data_local_dir().join("index"))
 }
 
@@ -148,6 +159,8 @@ fn main() -> Result<()> {
             limit,
             ext,
             sort,
+            root,
+            field,
         } => {
             let query_str = query.join(" ");
             if query_str.trim().is_empty() {
@@ -169,7 +182,23 @@ fn main() -> Result<()> {
             let ext_tokens = clean_ext_tokens(ext.iter().map(String::as_str));
             let ext_refs: Vec<&str> = ext_tokens.iter().map(String::as_str).collect();
             let ext_group = (!ext_refs.is_empty()).then_some(ext_refs.as_slice());
-            let hits = searcher.search_advanced(&query_str, limit, ext_group, sort_mode)?;
+            // 跟 --sort 不同，模式只有两个合法值，给错了会让人以为"只按文件名搜"
+            // 生效了、其实查的还是正文，所以这里不静默回退，直接报错退出。
+            let field_mode = match field.as_str() {
+                "content" => SearchField::Content,
+                "name" => SearchField::Name,
+                other => anyhow::bail!("未知的搜索模式 \"{other}\"，可选 content / name。"),
+            };
+            let page = searcher.search_scoped(
+                &query_str,
+                limit,
+                0,
+                ext_group,
+                sort_mode,
+                root.as_deref(),
+                field_mode,
+            )?;
+            let hits = page.hits;
 
             if hits.is_empty() {
                 println!("没搜到。索引里共 {} 篇文档。", searcher.num_docs());
@@ -423,6 +452,7 @@ fn watch(dir: Option<PathBuf>) -> Result<()> {
         });
 
     watch_roots_auto(&index, &roots, updater, stop, |progress| match progress {
+        WatchProgress::Reconciled => println!("  启动对账完成"),
         WatchProgress::Received(ev) => println!("  事件  {ev:?}"),
         WatchProgress::Committed {
             batch_size,

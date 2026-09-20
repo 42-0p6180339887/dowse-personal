@@ -6,7 +6,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::window_fx::TransparencyTier;
 
-/// 落盘在 `%LOCALAPPDATA%\dowse\data\config.json`，独立于索引目录。
+/// 自用版的独立应用标识：所有用户数据（配置、索引、日志）都落在
+/// `%LOCALAPPDATA%\dowse-personal\` 下，跟上游安装版用的 `dowse` 目录完全分开——
+/// 两个版本可以并存，互不覆盖对方的配置和索引。
+const APP_DIR_NAME: &str = "dowse-personal";
+
+/// 落盘在 `%LOCALAPPDATA%\dowse-personal\data\config.json`，独立于索引目录。
 /// 设计文档明确本里程碑不做设置界面——所有配置走托盘菜单和这个文件。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -62,16 +67,22 @@ impl Default for AppConfig {
     }
 }
 
-fn config_path() -> Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "dowse").context("拿不到用户数据目录")?;
-    Ok(dirs.data_local_dir().join("config.json"))
+/// 自用版的用户数据根目录：`%LOCALAPPDATA%\dowse-personal`。
+/// 独立于上游的 `%LOCALAPPDATA%\dowse`，避免两个版本混用同一份配置和索引。
+pub fn data_dir() -> Result<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", APP_DIR_NAME).context("拿不到用户数据目录")?;
+    Ok(dirs.data_local_dir().to_path_buf())
 }
 
-/// 索引目录固定放在 `%LOCALAPPDATA%\dowse\data\index`，跟被索引的目录无关，
-/// 和 dowse 命令行的约定保持一致，这样 CLI 建的索引浮窗也能直接用。
+fn config_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("config.json"))
+}
+
+/// 自用版索引目录固定放在 `%LOCALAPPDATA%\dowse-personal\data\index`，跟被索引的
+/// 目录无关，和 dowse 命令行的约定保持一致（命令行同样认 `dowse-personal`），
+/// 这样命令行建的索引自用版浮窗也能直接用。
 pub fn index_dir() -> Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "dowse").context("拿不到用户数据目录")?;
-    Ok(dirs.data_local_dir().join("index"))
+    Ok(data_dir()?.join("index"))
 }
 
 pub fn load() -> AppConfig {

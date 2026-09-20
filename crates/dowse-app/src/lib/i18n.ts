@@ -34,12 +34,41 @@ interface Strings {
 	filterCode: string;
 	filterImage: string;
 	filterIdleLabel: string;
+	// 类型下拉细分出来的六类常用文档
+	filterPdf: string;
+	filterWord: string;
+	filterExcel: string;
+	filterPpt: string;
+	filterText: string;
 	// 排序下拉
 	sortRelevance: string;
 	sortNewest: string;
 	sortOldest: string;
 	sortLargest: string;
+	sortSmallest: string;
 	sortIdleLabel: string;
+	// 结果表格列头
+	colName: string;
+	colPath: string;
+	colType: string;
+	colMtime: string;
+	colSize: string;
+	// 工具栏：范围与模式
+	scopeLabel: string;
+	scopeAll: string;
+	modeLabel: string;
+	modeContent: string;
+	modeName: string;
+	matchLabel: string;
+	matchNormal: string;
+	matchPhrase: string;
+	// 底部状态栏
+	statusHits: string;
+	statusIndexed: string;
+	statusIndexSize: string;
+	statusNoIndexSize: string;
+	/** 主界面上的索引管理入口（原来只有托盘里有）。 */
+	indexManage: string;
 	// 搜索框
 	searchPlaceholder: string;
 	// 结果计数分成前后缀，中间夹一个带滚动动画的数字组件
@@ -69,6 +98,33 @@ interface Strings {
 	previewLoading: string;
 	previewEmpty: string;
 	resizePreviewPane: string;
+	// 预览区 - 全文阅读与文内查找
+	pvTabContext: string;
+	pvTabFull: string;
+	pvOpenFile: string;
+	pvReveal: string;
+	pvCopySelection: string;
+	pvCopied: string;
+	pvCopyNothing: string;
+	pvLoadMore: string;
+	pvHasMore: (loaded: number, total: number) => string;
+	pvFullLoaded: (chars: number) => string;
+	pvLoadFailed: string;
+	pvRetry: string;
+	pvDocMissing: string;
+	pvFindPlaceholder: string;
+	pvFindPrev: string;
+	pvFindNext: string;
+	pvFindSearching: string;
+	pvFindNone: string;
+	pvFindCount: (current: number, total: number) => string;
+	// 预览区 - 抽取失败的状态占位文档（kind = err:xxx）
+	pvStatusUnsupported: string;
+	pvStatusEncrypted: string;
+	pvStatusCorrupted: string;
+	pvStatusNoText: string;
+	pvStatusOversize: string;
+	pvStatusUnknown: string;
 	// 结果列表 aria
 	resultListLabel: string;
 	// 图钉
@@ -172,11 +228,35 @@ const zh: Strings = {
 	filterCode: '代码',
 	filterImage: '图片',
 	filterIdleLabel: '全部类型',
+	filterPdf: 'PDF',
+	filterWord: 'Word',
+	filterExcel: 'Excel',
+	filterPpt: 'PPT',
+	filterText: '文本',
 	sortRelevance: '相关性',
 	sortNewest: '最新优先',
 	sortOldest: '最旧优先',
 	sortLargest: '最大优先',
+	sortSmallest: '最小优先',
 	sortIdleLabel: '相关性',
+	colName: '文件名',
+	colPath: '路径',
+	colType: '类型',
+	colMtime: '修改时间',
+	colSize: '大小',
+	scopeLabel: '范围',
+	scopeAll: '全部资料',
+	modeLabel: '模式',
+	modeContent: '内容',
+	modeName: '文件名',
+	matchLabel: '匹配',
+	matchNormal: '普通',
+	matchPhrase: '短语',
+	statusHits: '命中',
+	statusIndexed: '已索引',
+	statusIndexSize: '索引占用',
+	statusNoIndexSize: '—',
+	indexManage: '索引管理',
 	searchPlaceholder: '搜文件名或内容…',
 	resultsPrefix: '结果 · ',
 	resultsSuffix: ' 条',
@@ -200,9 +280,36 @@ const zh: Strings = {
 	previewLoading: '加载中…',
 	previewEmpty: '没有可预览的文本内容。',
 	resizePreviewPane: '调整结果与预览区域宽度',
+	pvTabContext: '命中上下文',
+	pvTabFull: '全文阅读',
+	pvOpenFile: '打开原文件',
+	pvReveal: '定位文件夹',
+	pvCopySelection: '复制选中',
+	pvCopied: '已复制选中的文字。',
+	pvCopyNothing: '先在正文里选中要复制的文字。',
+	pvLoadMore: '加载更多',
+	pvHasMore: (loaded, total) => `还有内容 · 已读 ${loaded} / ${total} 字`,
+	pvFullLoaded: (chars) => `全文已加载 · 共 ${chars} 字`,
+	pvLoadFailed: '正文加载失败。',
+	pvRetry: '重试',
+	pvDocMissing: '索引里找不到这篇文档（可能已被删除或改名）。',
+	pvFindPlaceholder: '在本文档中查找…',
+	pvFindPrev: '上一个匹配',
+	pvFindNext: '下一个匹配',
+	pvFindSearching: '查找中…',
+	pvFindNone: '无匹配',
+	pvFindCount: (current, total) => `${current} / ${total}`,
+	pvStatusUnsupported:
+		'旧版 Office 格式（.doc / .xls / .ppt）暂不支持解析，请另存为 .docx / .xlsx / .pptx 后重新建索引。',
+	pvStatusEncrypted: '文件被密码保护，无法提取文字。',
+	pvStatusCorrupted: '文件损坏或不是有效的对应格式，无法提取文字。',
+	pvStatusNoText:
+		'没有可提取的文字。扫描版 PDF 暂不支持文字提取（图片文件的 OCR 是另一条索引通道）。',
+	pvStatusOversize: '文件超过索引规则的体积上限，未提取文字。可在设置里调整上限后重建索引。',
+	pvStatusUnknown: '这个文件没有可阅读的正文。',
 	resultListLabel: '搜索结果',
-	pinUnpin: '取消固定（恢复失焦自动隐藏）',
-	pin: '固定（失焦不再自动隐藏）',
+	pinUnpin: '取消置顶',
+	pin: '窗口置顶（始终显示在最上层）',
 	scHide: '隐藏',
 	scCopyPath: '复制路径',
 	scReveal: '打开所在文件夹',
@@ -236,7 +343,7 @@ const zh: Strings = {
 	soCopyPath: '复制路径',
 	soFilterType: '筛选类型',
 	soSort: '排序',
-	soPin: '固定',
+	soPin: '窗口置顶',
 	soCheatSheet: '速查',
 	soSettings: '设置',
 	setTitle: '设置',
@@ -288,11 +395,35 @@ const en: Strings = {
 	filterCode: 'Code',
 	filterImage: 'Images',
 	filterIdleLabel: 'All types',
+	filterPdf: 'PDF',
+	filterWord: 'Word',
+	filterExcel: 'Excel',
+	filterPpt: 'PPT',
+	filterText: 'Text',
 	sortRelevance: 'Relevance',
 	sortNewest: 'Newest',
 	sortOldest: 'Oldest',
 	sortLargest: 'Largest',
+	sortSmallest: 'Smallest',
 	sortIdleLabel: 'Relevance',
+	colName: 'Name',
+	colPath: 'Path',
+	colType: 'Type',
+	colMtime: 'Modified',
+	colSize: 'Size',
+	scopeLabel: 'Scope',
+	scopeAll: 'All folders',
+	modeLabel: 'Mode',
+	modeContent: 'Content',
+	modeName: 'Filename',
+	matchLabel: 'Match',
+	matchNormal: 'Normal',
+	matchPhrase: 'Phrase',
+	statusHits: 'Hits',
+	statusIndexed: 'Indexed',
+	statusIndexSize: 'Index size',
+	statusNoIndexSize: '—',
+	indexManage: 'Index',
 	searchPlaceholder: 'Search names or contents…',
 	resultsPrefix: 'Results · ',
 	resultsSuffix: '',
@@ -316,9 +447,37 @@ const en: Strings = {
 	previewLoading: 'Loading…',
 	previewEmpty: 'No previewable text content.',
 	resizePreviewPane: 'Resize results and preview panes',
+	pvTabContext: 'Hit context',
+	pvTabFull: 'Full text',
+	pvOpenFile: 'Open file',
+	pvReveal: 'Reveal folder',
+	pvCopySelection: 'Copy selection',
+	pvCopied: 'Selection copied.',
+	pvCopyNothing: 'Select some text in the document first.',
+	pvLoadMore: 'Load more',
+	pvHasMore: (loaded, total) => `More content · ${loaded} / ${total} chars read`,
+	pvFullLoaded: (chars) => `Full text loaded · ${chars} chars`,
+	pvLoadFailed: 'Could not load the document text.',
+	pvRetry: 'Retry',
+	pvDocMissing: 'This document is no longer in the index (deleted or renamed?).',
+	pvFindPlaceholder: 'Find in this document…',
+	pvFindPrev: 'Previous match',
+	pvFindNext: 'Next match',
+	pvFindSearching: 'Searching…',
+	pvFindNone: 'No matches',
+	pvFindCount: (current, total) => `${current} / ${total}`,
+	pvStatusUnsupported:
+		'Legacy Office format (.doc / .xls / .ppt) is not supported yet — save as .docx / .xlsx / .pptx and rebuild the index.',
+	pvStatusEncrypted: 'The file is password-protected; no text could be extracted.',
+	pvStatusCorrupted: 'The file is corrupted or not a valid file of its type; no text could be extracted.',
+	pvStatusNoText:
+		'No extractable text. Scanned PDFs are not supported yet (image OCR is a separate indexing path).',
+	pvStatusOversize:
+		'The file exceeds the index size limit, so no text was extracted. Raise the limit in settings and rebuild.',
+	pvStatusUnknown: 'This file has no readable text.',
 	resultListLabel: 'Search results',
-	pinUnpin: 'Unpin (resume auto-hide on blur)',
-	pin: 'Pin (stop auto-hide on blur)',
+	pinUnpin: 'Stop keeping the window on top',
+	pin: 'Keep window on top',
 	scHide: 'Hide',
 	scCopyPath: 'Copy path',
 	scReveal: 'Reveal in File Explorer',
@@ -352,7 +511,7 @@ const en: Strings = {
 	soCopyPath: 'Copy path',
 	soFilterType: 'Filter type',
 	soSort: 'Sort',
-	soPin: 'Pin',
+	soPin: 'Keep on top',
 	soCheatSheet: 'Cheat sheet',
 	soSettings: 'Settings',
 	setTitle: 'Settings',

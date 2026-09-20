@@ -1,5 +1,5 @@
 //! 崩溃取证设施：把进程的 stdout/stderr 重定向到
-//! `%LOCALAPPDATA%\dowse\logs\dowse.log`（按体积轮转，2 个文件封顶），
+//! `%LOCALAPPDATA%\dowse-personal\logs\dowse.log`（按体积轮转，2 个文件封顶），
 //! 再挂一个 panic hook 记下崩溃线程/位置/信息。
 //!
 //! release 构建用 `windows_subsystem = "windows"`（见 main.rs）没有控制台，
@@ -18,7 +18,10 @@ use std::path::{Path, PathBuf};
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
 fn log_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "dowse").map(|dirs| dirs.data_local_dir().join("logs"))
+    // 跟 config.rs 的 data_dir 同一身份：自用版统一用 "dowse-personal"，
+    // 日志不跟上游 `dowse` 目录混在一起。
+    directories::ProjectDirs::from("", "", "dowse-personal")
+        .map(|dirs| dirs.data_local_dir().join("logs"))
 }
 
 fn log_file_path(dir: &Path) -> PathBuf {

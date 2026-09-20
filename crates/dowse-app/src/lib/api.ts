@@ -1,15 +1,19 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
 	AppSettings,
+	ContentChunk,
 	EffectLevel,
 	ExtGroup,
+	FindInDocResult,
 	GlassAlpha,
 	IndexingSnapshot,
 	IndexRules,
 	IndexStats,
 	IndexStatus,
+	IndexUsage,
 	LangOption,
 	PreviewResult,
+	SearchField,
 	SearchPage,
 	SortOption,
 	TransparencyTier
@@ -26,18 +30,47 @@ export function indexingStatus(): Promise<IndexingSnapshot> {
 	return invoke('indexing_status');
 }
 
+/// 状态栏的"索引占用"：索引目录实际占用的磁盘字节数 + 文档数。
+/// 不必每次搜索都拉——建索引完成、窗口呼出、索引变更时拉一次即可。
+export function indexUsage(): Promise<IndexUsage> {
+	return invoke('index_usage');
+}
+
+/// `root` 是搜索范围（限定在某个索引根下，null 表示全部资料），`field` 是搜索
+/// 模式（'name' 只查文件名）。两者都在 Rust 侧按"未知值退化成默认"处理，前端
+/// 传坏了不会让搜索报错。
 export function search(
 	query: string,
 	limit = 50,
 	offset = 0,
 	extGroup: ExtGroup = 'all',
-	sort: SortOption = 'relevance'
+	sort: SortOption = 'relevance',
+	root: string | null = null,
+	field: SearchField = 'content'
 ): Promise<SearchPage> {
-	return invoke('search', { query, limit, offset, extGroup, sort });
+	return invoke('search', { query, limit, offset, extGroup, sort, root, field });
 }
 
 export function preview(path: string, query: string): Promise<PreviewResult | null> {
 	return invoke('preview', { path, query });
+}
+
+/// 全文阅读：按 Unicode 字符分块读取**已索引正文**（不重新解析原文件）。
+/// 返回 null 表示路径不在索引里（文件被删/改名/还没收录）。
+/// `nextOffsetChars` 为 null 表示全文已加载。
+export function readContentChunk(
+	path: string,
+	offsetChars: number,
+	maxChars: number
+): Promise<ContentChunk | null> {
+	return invoke('read_content_chunk', { path, offsetChars, maxChars });
+}
+
+/// 文内查找：在指定文档的已索引全文上做字面查找（忽略英文大小写、正则符号
+/// 按普通文字处理），返回 Unicode 字符坐标的命中区间。返回 null 表示路径
+/// 不在索引里。
+export function findInDoc(path: string, needle: string): Promise<FindInDocResult | null> {
+	return invoke('find_in_doc', { path, needle });
 }
 
 export function openFile(path: string): Promise<void> {
@@ -78,8 +111,8 @@ export function fileIcon(ext: string): Promise<string | null> {
 	return invoke('file_icon', { ext });
 }
 
-/// 图钉固定开关：会话级，不落盘。固定期间失焦不再自动隐藏浮窗
-/// （见 Rust 侧 autohide.rs 的 AutoHideSuppressor）。
+/// 图钉开关：会话级，不落盘（重启回到 tauri.conf.json 的 alwaysOnTop: false）。
+/// 打开后窗口置顶、始终显示在最上层，方便一边对照别的程序一边查文档。
 export function setPinned(pinned: boolean): Promise<void> {
 	return invoke('set_pinned', { pinned });
 }

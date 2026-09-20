@@ -353,11 +353,29 @@ fn clear_acrylic_effect(window: &WebviewWindow) {
 /// `DwmSetWindowAttribute` 的 HRESULT 直接丢掉了，永远返回 `Ok`。所以这条链
 /// 天然测不出"申请到了但显示成纯色"这种情况，远程会话就是最典型的例子，
 /// 得单独识别、单独处理。
+/// 是否使用**标准窗口**（系统标题栏 + 系统边框）。
+///
+/// 开着时标题栏由系统绘制：最小化/最大化/关闭三个按钮、双击标题栏最大化、
+/// 拖到屏幕边缘吸附、Alt+Space 系统菜单这些行为全部由 Windows 自己保证，
+/// 比自绘按钮可靠得多（自绘按钮在远程会话/高 DPI/深色主题下都出过问题）。
+///
+/// 代价是不能再套 DWM 毛玻璃（Acrylic/Mica）——它们要求窗口无边框且透明，
+/// 有标题栏时套上去要么完全无效、要么把整块客户区渲染成纯黑。按"优先可靠的
+/// 窗口操作与整洁界面"这个取舍，这里固定走标准窗口，材质让路。
+pub const STANDARD_DECORATIONS: bool = true;
+
 pub fn apply_with_fallback(
     window: &WebviewWindow,
     transparency_enabled: bool,
     tier: TransparencyTier,
 ) -> EffectLevel {
+    // 标准窗口下不套任何材质，直接落纯色。从没申请过材质，也就不需要清
+    // SWCA 层；圆角裁切同样跳过（系统边框自带圆角，再裁一次只会把标题栏
+    // 的角切掉）。
+    if STANDARD_DECORATIONS {
+        return EffectLevel::Solid;
+    }
+
     // 圆角裁切跟材质降级链无关，纯色兜底和远程会话也一样受益，最前面无条件做一次。
     #[cfg(target_os = "windows")]
     apply_rounded_corners(window);
@@ -411,6 +429,9 @@ pub fn apply_with_fallback(
 /// 是同一个尺寸，见 app.css 里双框 bug 的修复说明），横向居中和纵向 22%
 /// 起摆都是相对屏幕尺寸的比例计算，不依赖任何写死的像素基准，换了窗口
 /// 尺寸不需要跟着改数。
+/// 把窗口挪到主屏"居中偏上"。自用版不再在呼出时调用它（见 [`show_window`]），
+/// 保留这个工具函数供将来需要"一键回到默认位置"之类入口时复用。
+#[allow(dead_code)]
 pub fn position_upper_center(window: &WebviewWindow) -> tauri::Result<()> {
     let Some(monitor) = window.current_monitor()? else {
         return Ok(());
@@ -425,10 +446,13 @@ pub fn position_upper_center(window: &WebviewWindow) -> tauri::Result<()> {
     window.set_position(PhysicalPosition::new(x, y))
 }
 
-/// 呼出：定位到居中偏上、显示、抢焦点，再广播一个事件给前端——
-/// 前端监听它来做"输入框自动聚焦、上次查询词全选"（设计文档的交互规则）。
+/// 呼出：显示、抢焦点，再广播一个事件给前端——前端监听它来做"输入框自动
+/// 聚焦、上次查询词全选"（设计文档的交互规则）。
+///
+/// 自用版改动：**不再每次呼出都把窗口挪到屏幕居中偏上**。文档阅读场景下
+/// 用户会自己拖动、缩放窗口，呼出时重置位置会把窗口从用户摆好的地方拽走；
+/// 初始位置交给 tauri.conf.json 的 `center: true` 定位一次，之后就保持不变。
 pub fn show_window(window: &WebviewWindow) {
-    let _ = position_upper_center(window);
     let _ = window.show();
     let _ = window.set_focus();
     let _ = window.emit("dowse://shown", ());

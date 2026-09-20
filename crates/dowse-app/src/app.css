@@ -48,6 +48,9 @@
 	--fg-primary: #101014;
 	--fg-secondary: #6b6b75;
 	--fg-tertiary: #9494a0;
+	/* 阅读正文：比 --fg-secondary(#6b6b75)更深、比 --fg-primary(#101014)柔和，
+	   长文阅读更护眼，也解决"工具栏/结果正文太灰看不清"的可读性问题。 */
+	--fg-reading: #2b2b30;
 	--divider: rgba(0, 0, 0, 0.08);
 	--glass-tint: rgba(255, 255, 255, var(--glass-alpha-light));
 	--solid-bg: #f3f3f6;
@@ -98,8 +101,9 @@
    的竖向渐变（近白 → 浅水蓝）增加通透感，前景色/分割线/滚动条则反过来
    固定用深色系半透明，确保浅底上文字始终清楚可读。 */
 :root[data-effect='solid'] {
-	--glass-tint: linear-gradient(180deg, #f8fbfe 0%, #e6f2fb 100%);
-	--solid-bg: #eef6fb;
+	/* 纯色降级档也要"干净"：把原来的浅蓝渐变压成近白，不再有大片水蓝。 */
+	--glass-tint: linear-gradient(180deg, #fbfcfe 0%, #f3f6f9 100%);
+	--solid-bg: #f4f7fa;
 	--fg-primary: #101014;
 	--fg-secondary: #6b6b75;
 	--fg-tertiary: #9494a0;
@@ -222,4 +226,14 @@ mark.hl {
 	background: transparent;
 	border-bottom: 1.5px solid var(--accent-border);
 	border-radius: 0;
+}
+
+/* 文内查找里的"当前命中"：比普通命中再强一档，让"上一个/下一个"跳过去之后
+   一眼能看出落在哪一处。叠加 outline 而不是换色，两种高亮方案（淡底/下划线）
+   下都能生效。 */
+mark.hl.active {
+	background: var(--accent-soft);
+	color: var(--accent-strong);
+	outline: 1.5px solid var(--accent-strong);
+	outline-offset: 1px;
 }

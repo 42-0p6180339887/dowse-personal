@@ -1,236 +1,61 @@
-English | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Italiano](README.it.md)
+# Dowse Personal · 本地文档全文搜索
 
-<p align="center">
-  <img src="crates/dowse-app/src-tauri/icons/128x128@2x.png" width="96" height="96" alt="dowse logo">
-</p>
+基于 [ltspace/dowse](https://github.com/ltspace/dowse) 的 Windows 个人文档搜索应用。采用搜索框、结果表格与固定预览的桌面流程，便于连续查找和阅读资料；不依赖 AnyTXT，也不使用其代码或资源。
 
-<h1 align="center">dowse</h1>
+这是 **2026-09-21 的可运行版本存档**。保留上游 Git 历史及 MIT / Apache-2.0 许可证，个人版改造基线为 `4026a34562bb0f79ea9e44d5d0b6c060de300baa`。该仓库不是上游官方发行版。
 
-<p align="center">
-  Open-source local file content search for Windows. Find file names, PDF and Office contents, source code, and text inside screenshots — one hotkey away.
-</p>
+## 下载和使用
 
-<p align="center">
-  <a href="https://lter.space/dowse/">Website</a> ·
-  <a href="https://lter.space/dowse/en/">English product page</a> ·
-  <a href="https://lter.space/dowse/windows-file-content-search/">Windows file-content search guide（中文）</a>
-</p>
+到 [Releases](https://github.com/42-0p6180339887/dowse-personal/releases) 下载 Windows x64 压缩包，解压后运行 `dowse-app.exe`。需要 Windows WebView2 Runtime；无需启动开发服务器。当前交付是直接运行 EXE，未提供安装器或代码签名。
 
-<p align="center">
-  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg" alt="License"></a>
-  <a href="https://github.com/ltspace/dowse/releases/latest"><img src="https://img.shields.io/github/v/release/ltspace/dowse" alt="Latest release"></a>
-  <a href="https://github.com/ltspace/dowse/actions/workflows/ci.yml"><img src="https://github.com/ltspace/dowse/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
-  <a href="https://github.com/ltspace/dowse/stargazers"><img src="https://img.shields.io/github/stars/ltspace/dowse?style=flat" alt="GitHub stars"></a>
-  <img src="https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white" alt="Platform: Windows">
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-2024_edition-orange?logo=rust&logoColor=white" alt="Rust edition 2024"></a>
-  <a href="https://github.com/ltspace/dowse/releases"><img src="https://img.shields.io/github/downloads/ltspace/dowse/total" alt="Downloads"></a>
-  <a href="https://glama.ai/mcp/servers/ltspace/dowse"><img src="https://glama.ai/mcp/servers/ltspace/dowse/badges/score.svg" alt="Glama MCP server score"></a>
-</p>
+1. 添加要搜索的资料文件夹，等待建立索引。建议从具体文档目录开始，不扫描整盘。
+2. 输入关键词，按文件类型、目录、内容/文件名模式筛选，支持排序与分页。
+3. 单击结果预览，双击或 Enter 打开原文件；切换“全文阅读”可加载正文和文内查找。
+4. 选定目录中的文件新增、修改、删除后自动更新，重启保留索引。
 
-The name comes from a dowsing rod.
+个人版数据位于 `%LOCALAPPDATA%\dowse-personal\data`，与上游默认数据目录隔离。默认不开机自启，窗口失焦后保持可见。
 
-![Dowse searching the fictional Northstar workspace, with ranked project files on the left and a live brief preview on the right](docs/screenshots/hero.png)
+## 功能与边界
 
-## Motivation
+| 功能 | 当前版本 |
+| --- | --- |
+| 正文提取 | 文字 PDF、DOCX、XLSX、PPTX、TXT、MD |
+| Excel | 工作表顺序、表名、单元格位置、共享/内联文字、数字、布尔值、已有公式缓存 |
+| PowerPoint | 按 presentation 关系定义的实际页序提取，保留页序标记 |
+| 阅读与查找 | 索引正文分块读取；字面查找、忽略英文大小写；中文、emoji、跨块命中跳转 |
+| 结果交互 | 可调整列宽、固定预览、类型/范围/模式筛选、排序、分页 |
+| 更新一致性 | 索引提交合并刷新；正文缓存随索引快照失效；丢弃过期界面响应 |
+| 错误反馈 | 不支持、损坏、加密、无可提取文字、超过限制等状态 |
 
-No Windows tool satisfies all three of the following at once:
+限制：旧版 `.doc/.xls/.ppt`、扫描 PDF 和图片 OCR 未纳入个人版交付；预览为提取文字，不还原原排版；公式不重新计算。大型真实资料库的内存、首次建库耗时和长期监听尚未完成系统压测。Office 临时锁文件暂未排除。
 
-- Keep a persistent index of file contents, not just file names (Everything can scan contents on demand, but its instant index is centered on names and paths)
-- Recognize and index text inside images on ordinary Windows PCs without requiring a Copilot+ device
-- One hotkey to summon, full keyboard operation, no perceptible latency
+正文已使用上游 LZ4 压缩。本版增加有界缓存和刷新调度，没有删除检索字段或截断全文，也没有足够的同语料前后对照来宣称索引缩小或算法加速比例。
 
-The closest open-source implementation is sist2, but it targets Linux (on Windows it only runs via Docker), treats Chinese text as trigrams, and the project is no longer maintained. dowse is a Windows-native implementation built around these three points.
+## 从源码构建
 
-## Features
-
-| | |
-|---|---|
-| 🔍 **File name search** | Instant, as you type |
-| 📄 **Document content search** | Plain text, Markdown, code, and document formats (PDF, Word, Excel, PowerPoint) |
-| 🖼️ **Screenshot / image OCR** | Text inside PNG/JPG/WebP/BMP images, fully offline (Windows.Media.Ocr) |
-| 🈶 **Chinese word segmentation** | jieba + BM25 ranking, not trigrams — plus automatic GBK encoding detection |
-| ⚡ **Incremental indexing** | File-watch during runtime, mtime/size reconciliation at startup |
-| 🤖 **MCP server** | Exposes local search to AI agents over stdio |
-| 🚀 **NTFS fast path** | MFT enumeration + USN Journal, admin-only, falls back transparently otherwise |
-
-## dowse vs. the alternatives
-
-| | dowse | Everything | Windows Search | sist2 |
-|---|:---:|:---:|:---:|:---:|
-| File name search | ✓ | ✓ | ✓ | ✓ |
-| Document content search | ✓ (persistent index) | on-demand scan | depends on indexed locations and filters | ✓ |
-| Screenshot / image OCR | ✓ | ✗ | device/version dependent | limited (optional Tesseract) |
-| Proper Chinese segmentation | ✓ (jieba) | — | limited | ✗ (trigrams) |
-| Fully local, no network | ✓ | ✓ | ✓ | ✓ |
-| Global hotkey overlay | ✓ | ✓ | ✓ (Win key) | ✗ (web UI) |
-| Windows-native | ✓ | ✓ | ✓ | ✗ (Linux-first, Docker on Windows) |
-
-## Chinese text handling
-
-- Word segmentation via jieba, ranking via BM25 (tantivy engine). No trigrams.
-- Automatic file encoding detection (chardetng). GBK-encoded files are decoded correctly before indexing — this matters because a large share of Chinese-language documents on Windows, especially older ones, are still saved in GBK rather than UTF-8, and a search tool that assumes UTF-8 will silently mis-index or garble them.
-- Multi-term queries default to AND semantics. Quoted phrase queries match on exact position. Inline operators narrow things down further: `path:reports`, `mtime:>2026-01-01`, `size:>10mb`, uppercase `OR` between groups, `-term` to exclude.
-- OCR runs on the Windows-native engine (Windows.Media.Ocr), fully offline. The zh-Hans language pack also covers mixed Chinese/English text, no extra configuration required.
-
-## Performance
-
-Design targets; exceeding them is treated as a defect. "Measured" is a from-scratch
-benchmark of `dowse 0.7.0` (i7-13700K / 24 logical cores / 64GB RAM, single machine,
-single session, 2026-07-12), reusing the byte-identical corpus from the v0.6.1 round-3
-benchmark for direct comparability. Full raw output (index/search logs, JSON result
-files) is kept with the benchmark working directory, outside this repo.
-
-| Metric | Design target | Measured (v0.7.0, 2026-07-12) |
-|---|---|---|
-| Hotkey to window visible | < 50ms | not measured — CLI-only benchmark, no overlay-app instrumentation |
-| Keystroke to results rendered | < 80ms | not measured — same |
-| OCR, single image | ~112ms / 1080p screenshot | ~170ms isolated (480×200 synthetic image), unchanged from v0.6.1 — the OCR pipeline was not modified this release. Sub-30ms readings on immediate repeat runs of the same image reflect OS-level recognition caching, not real recognition, and are excluded here. Not real 1080p screenshots |
-| Resident memory | < 150MB idle | not measured (idle); peak working set during full-corpus indexing was ~327MB — a different metric, not a regression against the idle target |
-| Installer size | < 50MB (revised 2026-07 — the original 15MB target predates the bundled CLI sidecar) | **14.98MB** (`dowse-app_0.9.0_x64-setup.exe`, published release) |
-| Full-text index build, 10,000 files / 437MB | seconds (planned filename-only fast path) | 10.0–10.6s — current full-content `dowse index`, not the planned filename-only MFT path |
-| Full-text index build + OCR, 15,100 files (incl. 5,100 images) | — | ~46.6s first pass, all 5,100/5,100 images OCR'd in that same pass — no pending, no second pass needed |
-| Search latency, P50 (5 required categories) | — | 30.7–161.1ms across single word / Chinese phrase / English phrase / multi-word AND / zero-result, on a 15,100-document index |
-| Search latency, P95 | — | 39.1–172.3ms, same 5 categories |
-| `ext:` filter query latency | — | P50 155.6ms, same band as the non-zero-result query categories |
-| Index size ÷ corpus size | — | 0.36 (text-only), down from 0.54 in the v0.6.1 round |
-
-Full-corpus rows measured on the same 10,000-file / 437.66MB text corpus plus 5,100
-synthetic 480×200 OCR images (89.8MB) used for the v0.6.1 round-3 numbers above —
-byte-identical, reused directly rather than regenerated. Indexing is roughly 2x faster
-and the on-disk text index roughly a third smaller than v0.6.1; both track the new
-tokenizer (lowercase normalization, alphanumeric-boundary splitting of Latin words)
-producing a leaner term dictionary. The zero-result query dropped from 135ms (v0.6.1)
-to a startup-noise-level 31ms, consistent with less index to scan before concluding a
-term is absent. OCR recognition speed is unchanged this release, since the pipeline was
-not touched: single-image recognition stays around 170ms, and the sub-30ms readings on
-repeated identical images are OS-level caching artifacts, not real recognition. The
-full-corpus text-plus-OCR pass got faster (83s to 46.6s) from the quicker tokenizer and
-write path, not from faster recognition.
-
-## Quick start
-
-**Download** — grab the installer from the [latest release](https://github.com/ltspace/dowse/releases/latest) (`dowse-app_*_x64-setup.exe`), run it, then `Alt+\`` to summon.
-
-The installer is unsigned, so Windows SmartScreen will flag it on first run. To proceed, click **More info** and then **Run anyway**. A code-signing certificate is a recurring cost that is hard to justify for an independent project; it may be reconsidered for a future release.
-
-**Install the CLI** — the library and command-line tool ship as one `dowse` package:
+环境：Windows x64、近期 Rust stable（MSVC 工具链）、Node.js 22.12+、Visual Studio 2022 C++ Build Tools 与 Windows SDK。请在 **Developer PowerShell for VS 2022** 中执行：
 
 ```powershell
-cargo install dowse                 # once published to crates.io
-cargo install --path crates/dowse   # from a local checkout
+.\Build-Windows.ps1
+.\target\release\dowse-app.exe
 ```
 
-**Build from source:**
+脚本按顺序安装前端依赖并构建、生成 CLI sidecar、构建独立桌面应用。桌面构建必须启用 `--features custom-protocol`，否则可能仍连接开发地址并出现 localhost 拒绝连接。重建前先关闭运行中的 EXE。
+
+前端与 Rust 验证入口：
 
 ```powershell
-git clone https://github.com/ltspace/dowse && cd dowse
-
-# CLI
-cargo run -p dowse -- index D:\docs      # build the index
-cargo run -p dowse -- search 限流         # search
-cargo run -p dowse -- search "精确短语"   # phrase query
-cargo run -p dowse -- add E:\projects     # add another root incrementally (no full rebuild)
-cargo run -p dowse -- rules show          # view index rules (excluded dirs, extra extensions, size cap)
-
-# Overlay app (Tauri 2 + Svelte 5)
-cd crates/dowse-app
-npm install
-cargo tauri build      # produces the installer under target/release/bundle
+npm --prefix crates/dowse-app run check
+npm --prefix crates/dowse-app run test:unit
+cargo test -p dowse
 ```
 
-Overlay app: `Alt+\`` to summon, `↑↓` to select, `Enter` to open, `Ctrl+Enter` to reveal in Explorer, `Ctrl+C` to copy path, `Esc` to hide. Results are paginated in groups of 50; the compact `‹ 1 / N ›` control shows only when needed, and pressing `↓` past the last result or `↑` before the first moves between pages. Two nearly invisible dropdowns sit at the right of the search bar — file type filter (`Ctrl+P`) and sort order (`Ctrl+S`, relevance / newest / oldest / largest); both stay faint until you select a non-default value. Right-click a result row for a native Explorer-style context menu (open / reveal in folder / copy path / copy name). A pin toggle at the top-right keeps the window open when it loses focus (session-only, resets on restart). With an empty input, the overlay lists your recent searches (last 10, stored locally) — `↑↓`/`Enter` to reuse one, `Delete` to remove it. `Ctrl+,` opens the settings panel — general (hotkey rebinding, transparency, autostart, interface language) and index rules (excluded directories, extra text extensions, per-file size cap).
+用于构造合成资料的标准库脚本：`python scripts/generate-test-documents.py <独立输出目录>`。仓库不包含个人文件、索引、配置、模型凭据或本机过程日志。上游工作流在此存档中只允许手动触发，不自动部署官网或生成其他发行包。
 
-![Dowse settings panel in English, with controls for the global shortcut, transparency, startup behavior, and interface language](docs/screenshots/settings.png)
+## 验收与来源
 
-![Preview pane for an image result: the source image rendered inline next to its OCR-extracted text with the matched terms highlighted](docs/screenshots/ocr-preview.png)
+参见 [验收摘要](docs/ACCEPTANCE.md)：记录实际运行的功能、具体构建标识和未测范围。编译成功不等于全部功能通过。
 
-## MCP server
+本仓库沿用上游的 **MIT OR Apache-2.0** 双许可，原版权声明保留于 [LICENSE-MIT](LICENSE-MIT) 和 [LICENSE-APACHE](LICENSE-APACHE)。上游的其他语言说明、开发文档及网站源码作为来源历史保留，可能描述本个人版未验收的功能；个人版能力以本 README 为准。
 
-`dowse mcp` starts a read-only [MCP](https://modelcontextprotocol.io) server over stdio, exposing the local index to AI agents:
-
-```
-claude mcp add --scope user dowse -- dowse mcp
-```
-
-Four tools: `search` (query, bounded `limit` / `offset`, `sort` by relevance / mtime / size, comma-separated `ext` filter, and a `total_hits` count), `preview` (long context + metadata for one hit), `read_file_chunk` (bounded, paginated text from the indexed snapshot), and `index_status` (document count, index health, active index rules). The server never touches the index writer or opens arbitrary paths — it only reloads the reader before each call, so it can run alongside the overlay app or a live `dowse watch` session without write contention.
-
-## Architecture
-
-```
-                 ┌─────────────────────────────────────────┐
-                 │                   dowse                   │
-                 │  library core: tantivy index · jieba      │
-                 │  segmentation · encoding detection ·      │
-                 │  text extraction (txt/md/pdf/code/        │
-                 │  docx/xlsx/pptx) · OCR pipeline           │
-                 │  ─────────────────────────────────────    │
-                 │  CLI + MCP server (default `cli` feature) │
-                 └────────────────────┬────────────────────┘
-                                      │ library API
-                                      │ (default-features = false)
-                              ┌───────┴────────┐
-                              │    dowse-app    │
-                              └────────────────┘
-```
-
-Two crates. `dowse` is both the search library and the command-line tool: the library core exposes the search API, and the CLI plus the read-only MCP server ride behind the default `cli` feature in a single binary — the CLI for scripting and debugging, the MCP server for AI agents. `dowse-app`, a Tauri 2 + Svelte 5 resident overlay, is a separate crate that depends on `dowse` as a library only (`default-features = false`, so it pulls in neither the CLI nor its dependencies).
-
-Index updates run on a two-tier scheme: while running, file system events drive incremental updates (500ms debounce window, batched commits); at startup, an mtime/size comparison reconciles changes made while the app was not running. On NTFS volumes with admin rights, the same two tiers are served by MFT enumeration and the USN Journal instead of directory walks and file-system-event watching; both paths produce identical results and the upper layers cannot tell which one is active.
-
-## Roadmap
-
-| # | Scope | Status |
-|---|---|---|
-| 1 | CLI indexing and search: Chinese segmentation, GBK detection, highlighting | ✅ Done |
-| 2 | Overlay: global hotkey, Acrylic material, keyboard navigation | ✅ Done |
-| 3 | Incremental indexing: file watching, startup reconciliation | ✅ Done |
-| 4 | OCR pipeline: screenshot text into the index | ✅ Done |
-| 5 | MCP server | ✅ Done |
-| 6 | NTFS MFT / USN Journal fast path | ✅ Done (the admin-only fast path itself is not yet verified on real hardware — see the design doc's implementation notes) |
-| 7 | Semantic search (embeddings, hybrid ranking) | 🔍 Exploring |
-
-## Stack
-
-Rust · [tantivy](https://github.com/quickwit-oss/tantivy) · jieba · Tauri 2 · Svelte 5 · Windows.Media.Ocr · notify · Win32 (MFT/USN Journal)
-
-## Design docs
-
-- [docs/DESIGN-M2-浮窗.md](docs/DESIGN-M2-浮窗.md) (overlay design, Chinese)
-- [docs/DESIGN-M3-增量索引.md](docs/DESIGN-M3-增量索引.md) (incremental indexing design, Chinese)
-- [docs/DESIGN-M4-OCR管线.md](docs/DESIGN-M4-OCR管线.md) (OCR pipeline design, Chinese)
-- [docs/DESIGN-M5-MCP.md](docs/DESIGN-M5-MCP.md) (MCP server design, Chinese)
-- [docs/DESIGN-M6-NTFS快速层.md](docs/DESIGN-M6-NTFS快速层.md) (NTFS fast path design, Chinese)
-
-## Privacy Policy
-
-The index is stored locally (`%LOCALAPPDATA%\dowse`). No network access, no telemetry. You can verify this yourself: watch the process in Resource Monitor or a firewall tool and confirm it opens no outbound connections. Releases also include a SHA-256 checksum for the installer so you can verify the download.
-
-Full policy — data collection, storage, retention, and contact: [PRIVACY.md](PRIVACY.md).
-
-## License
-
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
-
-## A note
-
-As a kid I had a single Coolpad phone. In the long stretches without internet, I would open
-the file manager and study the files one by one, trying to figure out what they were and how
-they fit together, forever lost among files scattered everywhere with no idea what any of
-them held.
-
-In college I bought a QNAP NAS and discovered Qsirch, a genuinely good thing, except it lived
-only on the NAS and had no Windows version.
-
-screenpipe got there first, a kind of primitive version of the memory grain from Black Mirror
-S1E3, The Entire History of You. Very future, very post-modern, close to the ultimate form of
-local search, but far too heavy for the world as it is now.
-
-So I made dowse.
-
-The film Her reads like a prophecy: before long, AI will run our personal computers. dowse
-takes its cue from that and exposes an MCP interface for AI to call, except what it searches
-is your own files, on your own machine.
-
-If you are a little obsessive, if you like keeping things in order, if you want real control
-over your own file system, this is for you. Performance and beauty are things I cared about
-just as much.
+English: A Windows document full-text search and reading app derived from Dowse, with a persistent desktop window, tabular results, indexed full-text preview, literal in-document search, and improved Office extraction. This repository archives the tested personal edition; see the limitations and acceptance summary above.

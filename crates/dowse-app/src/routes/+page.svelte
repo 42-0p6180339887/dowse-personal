@@ -13,6 +13,8 @@
 		IndexingPhase,
 		IndexingSnapshot,
 		IndexProgress,
+		IndexUsage,
+		SearchField,
 		SearchHit,
 		SortOption,
 		TextSegment
@@ -49,8 +51,15 @@
 
 	// 类型筛选 / 排序器两个幽灵态下拉的选项表——顺序即菜单里的显示顺序，
 	// 第一项永远是"默认值"（对应 GhostDropdown 的 defaultValue）。文案跟随系统语言。
+	// 前六项就是界面"类型"下拉要的那六类常用文档，后三项保留粗粒度分组
+	// （全部文档/代码/图片）——细分覆盖不到的场景还能退回大类别。
 	const TYPE_OPTIONS = [
 		{ value: 'all', label: t.filterAll },
+		{ value: 'pdf', label: t.filterPdf },
+		{ value: 'word', label: t.filterWord },
+		{ value: 'excel', label: t.filterExcel },
+		{ value: 'ppt', label: t.filterPpt },
+		{ value: 'text', label: t.filterText },
 		{ value: 'doc', label: t.filterDoc },
 		{ value: 'code', label: t.filterCode },
 		{ value: 'image', label: t.filterImage }
@@ -59,7 +68,16 @@
 		{ value: 'relevance', label: t.sortRelevance },
 		{ value: 'mtime_desc', label: t.sortNewest },
 		{ value: 'mtime_asc', label: t.sortOldest },
-		{ value: 'size_desc', label: t.sortLargest }
+		{ value: 'size_desc', label: t.sortLargest },
+		{ value: 'size_asc', label: t.sortSmallest }
+	];
+	const MODE_OPTIONS = [
+		{ value: 'content', label: t.modeContent },
+		{ value: 'name', label: t.modeName }
+	];
+	const MATCH_OPTIONS = [
+		{ value: 'normal', label: t.matchNormal },
+		{ value: 'phrase', label: t.matchPhrase }
 	];
 
 	let query = $state('');
@@ -72,7 +90,20 @@
 	let numDocs = $state(0);
 	/** 已注册的全部索引根（已过 display_path 清洗），空态逐行列出。 */
 	let roots = $state<string[]>([]);
+	/// 状态栏"索引占用"；null 表示还没拉到（首次查询前显示"—"）。
+	let indexUsage = $state<IndexUsage | null>(null);
+
+	// 范围下拉：第一项"全部资料"，其余是已注册的索引根。根列表取自索引状态，
+	// 一个根都没有时就只剩"全部资料"一项——此时没什么可挑，但仍照常渲染，
+	// 免得工具栏在建索引前后宽度跳动。
+	let SCOPE_OPTIONS = $derived([
+		{ value: 'all', label: t.scopeAll },
+		...roots.map((r) => ({ value: r, label: r }))
+	]);
 	let previewSegments = $state<TextSegment[] | null>(null);
+	/// 选中文档在索引里的 kind：正常是 "text"/"image"，抽取失败是 "err:xxx"
+	/// 短码（预览区据此显示"不支持/加密/损坏/无可提取文字/超限"的明确状态）。
+	let previewKind = $state<string | null>(null);
 	let previewLoading = $state(false);
 	let rebuildState = $state<'idle' | 'rebuilding' | 'error'>('idle');
 	let rebuildError = $state('');
@@ -84,7 +115,7 @@
 	// pickDirectoryAndRebuild）。
 	let indexingProcessed = $state(0);
 	let indexingCurrentFile = $state('');
-	let indexingReport = $state<{ indexed: number; seconds: number } | null>(null);
+	let indexingReport = $state<{ indexed: number; seconds: number; skippedOversize?: number | null } | null>(null);
 
 	// 建索引进度的"活的"状态：`indexingPhase` 是单一事实来源，决定要不要展示
 	// 文本阶段的全屏引导层（'text'）、OCR 阶段的常驻进度条（'ocr'，不遮挡
@@ -94,6 +125,16 @@
 	let indexingPhase = $state<IndexingPhase>('idle');
 	let indexingOcrProcessed = $state(0);
 	let indexingOcrTotal = $state(0);
+
+	// 每次"重建 / 添加根"操作一个自增序号：定时器回调用**捕获到的序号**跟当前
+	// 序号比对，决定是否复位引导层——而不是像以前那样拿 `$state` 代理对象去跟原始
+	// 对象比引用。Svelte 5 的 `$state` 读写都经过响应式代理，`indexingReport` 读出来
+	// 的是代理、`report` 是普通对象，两者引用永远不同，旧写法
+	// `if (indexingReport !== report) return;` 恒为 true，导致重建成功后
+	// `rebuildState` / `indexingPhase` 永远回不到 idle、全屏引导层永远不收回、结果被
+	// 遮挡（"7 篇 0.2 秒"一直挡着、搜出来的结果看不到）。这也是 03:21 release 被
+	// Codex 抓到的 GUI P1。
+	let indexingOpToken = 0;
 
 	function applyIndexingEvent(
 		event:
@@ -124,10 +165,25 @@
 
 	let extGroup = $state<ExtGroup>('all');
 	let sortOption = $state<SortOption>('relevance');
+	/** 搜索范围：null = 全部资料，否则是某个索引根的路径。做成显式下拉而不是
+	 * 让用户自己敲 `path:` 语法——记语法是给人添麻烦，且敲错了只会得到空结果。 */
+	let scopeRoot = $state<string | null>(null);
+	/** 搜索模式：'content' 查文件名+正文，'name' 只查文件名。 */
+	let searchMode = $state<SearchField>('content');
+	/** 匹配模式：'phrase' 给查询词整体加引号，按相邻词匹配。 */
+	let matchMode = $state<'normal' | 'phrase'>('normal');
 	let typeMenuOpen = $state(false);
 	let sortMenuOpen = $state(false);
 	let typeMenuIndex = $state(0);
 	let sortMenuIndex = $state(0);
+	// 范围/模式/匹配三个下拉各自的开合与高亮项——跟类型/排序是同一套机制，
+	// 只是这三个默认常显（见工具栏），所以初始 index 直接对齐当前值。
+	let scopeMenuOpen = $state(false);
+	let modeMenuOpen = $state(false);
+	let matchMenuOpen = $state(false);
+	let scopeMenuIndex = $state(0);
+	let modeMenuIndex = $state(0);
+	let matchMenuIndex = $state(0);
 	let pinned = $state(false);
 	let shortcutOverlayOpen = $state(false);
 	let hotkeyLabel = $state('Alt+`');
@@ -170,8 +226,8 @@
 	let guidanceKind = $derived.by((): 'idle' | 'no-index' | 'no-results' | 'rebuilding' | 'error' => {
 		if (rebuildState === 'rebuilding' || indexingPhase === 'text') return 'rebuilding';
 		if (rebuildState === 'error') return 'error';
-		if (query.trim().length === 0) return 'idle';
 		if (hasIndex === false) return 'no-index';
+		if (query.trim().length === 0) return 'idle';
 		if (hits.length === 0) return 'no-results';
 		return 'idle';
 	});
@@ -187,6 +243,13 @@
 			hasIndex = false;
 			numDocs = 0;
 			roots = [];
+		}
+		// 索引占用单独拉：它要遍历索引目录统计字节，失败也不该影响上面那几个
+		// 决定界面能不能用的字段。
+		try {
+			indexUsage = await api.indexUsage();
+		} catch {
+			indexUsage = null;
 		}
 	}
 
@@ -218,6 +281,26 @@
 		}
 	}
 
+	// 短语模式：给查询词整体加引号，让引擎按相邻词匹配（"限流 中间件"在两个词
+	// 紧挨着时才算命中）。已经带引号的不重复包一层——`""词""` 会被解析成空串，
+	// 结果反而什么都搜不到。
+	let effectiveQuery = $derived.by(() => {
+		const q = query.trim();
+		if (matchMode !== 'phrase' || q.length === 0) return q;
+		if (q.length >= 2 && q.startsWith('"') && q.endsWith('"')) return q;
+		return `"${q}"`;
+	});
+
+	/// 状态栏"索引占用"用的体积格式化。值为 0（索引目录读不到）时显示"—"——
+	/// "读不到"不能显示成"0 B"，那会被当成"索引不占空间"。
+	function formatBytes(bytes: number): string {
+		if (!bytes) return t.statusNoIndexSize;
+		if (bytes < 1024) return `${bytes} B`;
+		if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+		if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+		return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+	}
+
 	// 键入 30ms 防抖即搜——查询词变了就重新发起，过期响应用 token 挡掉。
 	// 类型筛选 / 排序器的选择跟查询词一起参与防抖：选中即重搜，不需要额外
 	// 的"应用"按钮。这个常量同时喂给下面的 setTimeout 和 reportSearchPerf
@@ -225,15 +308,43 @@
 	const SEARCH_DEBOUNCE_MS = 30;
 	let searchToken = 0;
 	let previousSearchCriteria = '';
+	// 记录上一次 effect 重跑时的索引刷新 nonce 与页码，用来区分"索引变更刷新"
+	// 与"普通翻页"——只有 nonce 变化且查询与页码都没变才算刷新、才按路径保留选中。
+	let previousRefreshNonce = 0;
+	let previousPageIndex = 0;
 	let pendingPageSelection: 'first' | 'last' = 'first';
+	// 索引变更事件（dowse://index-changed）翻转这个 nonce，强制搜索 effect 用**相同**
+	// 查询条件重跑一次，从而刷新结果、同时按路径保留当前选中文件——而不是靠重新
+	// 键入触发（那会重置选中、丢掉正在阅读的位置）。
+	let refreshNonce = $state(0);
+	// 文件监听活跃提交时的"更新中…"指示：收到事件立即亮起，防抖合并刷新后熄灭。
+	let indexWatchActive = $state(false);
+	let indexChangedTimer: ReturnType<typeof setTimeout> | null = null;
 	$effect(() => {
-		const q = query;
+		const q = effectiveQuery;
 		const group = extGroup;
 		const sort = sortOption;
+		const scope = scopeRoot;
+		const mode = searchMode;
+		const match = matchMode;
 		const requestedPage = pageIndex;
 		const token = ++searchToken;
-		const criteria = `${q}\u0000${group}\u0000${sort}`;
-		if (criteria !== previousSearchCriteria) {
+		// 读一下 refreshNonce 把它登记成依赖：索引变更事件翻转它时，本 effect 会用
+		// 相同查询条件重跑（见下方 wasRefresh 分支），刷新结果同时保留选中文件。
+		const nonce = refreshNonce;
+		void nonce;
+		const criteria = `${q}\u0000${group}\u0000${sort}\u0000${scope}\u0000${mode}\u0000${match}`;
+		const isCriteriaChange = criteria !== previousSearchCriteria;
+		const isNonceChange = nonce !== previousRefreshNonce;
+		const isPageChange = requestedPage !== previousPageIndex;
+		// 只在"索引变更事件翻转 nonce"这一种情况才按路径保留选中文件；
+		// 普通翻页（页码变化）或查询条件变化都不算刷新，必须走首/末行选中逻辑，
+		// 否则翻页会被误判成刷新、丢掉用户想看的页首/页末行。
+		const wasRefresh = isNonceChange && !isCriteriaChange && !isPageChange;
+		// 记录本次 nonce / 页码，供下次 effect 重跑时区分"刷新"还是"翻页"。
+		previousRefreshNonce = nonce;
+		previousPageIndex = requestedPage;
+		if (isCriteriaChange) {
 			previousSearchCriteria = criteria;
 			pendingPageSelection = 'first';
 			if (requestedPage !== 0) {
@@ -265,9 +376,14 @@
 					SEARCH_PAGE_SIZE,
 					pageOffset(requestedPage),
 					group,
-					sort
+					sort,
+					scope,
+					mode
 				);
 				if (token !== searchToken) return;
+				// 索引变更重查时，先记下当前选中的文件路径，重查后尽量回到同一篇，
+				// 保留用户的选中与阅读位置（文件被删/不再命中则夹紧下标）。
+				const prevPath = wasRefresh ? selectedHit?.path ?? null : null;
 				const resolvedPages = pageCount(results.total);
 				const resolvedPage = clampPageIndex(requestedPage, resolvedPages);
 				if (resolvedPage !== requestedPage) {
@@ -276,8 +392,13 @@
 				}
 				hits = results.hits;
 				totalHits = results.total;
-				selectedIndex = pendingPageSelection === 'last' ? Math.max(0, results.hits.length - 1) : 0;
-				pendingPageSelection = 'first';
+				if (wasRefresh && prevPath) {
+					const idx = results.hits.findIndex((h) => h.path === prevPath);
+					selectedIndex = idx >= 0 ? idx : Math.min(selectedIndex, Math.max(0, results.hits.length - 1));
+				} else {
+					selectedIndex = pendingPageSelection === 'last' ? Math.max(0, results.hits.length - 1) : 0;
+					pendingPageSelection = 'first';
+				}
 				lastSearchMs = performance.now() - startedAt;
 				reportSearchPerf(keystrokeAt, startedAt, token);
 			} catch (err) {
@@ -321,12 +442,16 @@
 	}
 
 	// 选中行变了就换一份更长的预览上下文；轻微防抖避免按住方向键连续刷。
+	// 预览自带的"全文阅读 / 文内查找"状态由 PreviewPane 内部管理：这里的
+	// token 只负责"这个文件这一轮预览请求是否过期"，切换文件时旧请求的
+	// 响应会被丢弃，不会覆盖新文件的预览。
 	let previewToken = 0;
 	$effect(() => {
 		const hit = selectedHit;
 		const q = query;
 		if (!hit) {
 			previewSegments = null;
+			previewKind = null;
 			previewLoading = false;
 			return;
 		}
@@ -337,9 +462,11 @@
 				const result = await api.preview(hit.path, q);
 				if (token !== previewToken) return;
 				previewSegments = result?.segments ?? null;
+				previewKind = result?.kind ?? null;
 			} catch (err) {
 				if (token !== previewToken) return;
 				previewSegments = null;
+				previewKind = null;
 				console.error('preview failed', err);
 			} finally {
 				if (token === previewToken) previewLoading = false;
@@ -365,6 +492,9 @@
 		indexingProcessed = 0;
 		indexingCurrentFile = '';
 		indexingReport = null;
+		// 捕获本次操作的序号；定时器里据此判断"这期间有没有更新的操作插进来"，
+		// 有就别复位（交给定版本去收尾），没有才把引导层收回。
+		const myOp = ++indexingOpToken;
 		try {
 			const stats = await api.rebuildIndex(dir);
 			hasIndex = true;
@@ -375,15 +505,17 @@
 			applyOcrPending(stats.ocr_pending);
 			// 冷报告替换掉实时计数，停留片刻后收回整个引导层——用户看得见
 			// "完成了"，不需要再点一下才能回到搜索态。
-			const report = {
+			indexingReport = {
 				indexed: stats.indexed,
 				seconds: stats.seconds,
 				skippedOversize: stats.skipped_oversize
 			};
-			indexingReport = report;
 			setTimeout(() => {
-				if (indexingReport !== report) return;
+				// 用序号判活，不靠对象引用：此间若没有更新的操作（myOp 仍是最新），
+				// 才把重建态 / 文本阶段 / 冷报告一并收掉，回到可搜索态。
+				if (myOp !== indexingOpToken) return;
 				rebuildState = 'idle';
+				indexingPhase = 'idle';
 				indexingReport = null;
 			}, 1800);
 		} catch (err) {
@@ -451,19 +583,20 @@
 		indexingProcessed = 0;
 		indexingCurrentFile = '';
 		indexingReport = null;
+		const myOp = ++indexingOpToken;
 		try {
 			const stats = await api.addRoot(dir);
 			refreshIndexStatus();
 			applyOcrPending(stats.ocr_pending);
-			const report = {
+			indexingReport = {
 				indexed: stats.indexed,
 				seconds: stats.seconds,
 				skippedOversize: stats.skipped_oversize
 			};
-			indexingReport = report;
 			setTimeout(() => {
-				if (indexingReport !== report) return;
+				if (myOp !== indexingOpToken) return;
 				rebuildState = 'idle';
+				indexingPhase = 'idle';
 				indexingReport = null;
 			}, 1800);
 		} catch (err) {
@@ -539,10 +672,13 @@
 	function closeMenus() {
 		typeMenuOpen = false;
 		sortMenuOpen = false;
+		scopeMenuOpen = false;
+		modeMenuOpen = false;
+		matchMenuOpen = false;
 	}
 
 	function openTypeMenu() {
-		sortMenuOpen = false;
+		closeMenus();
 		typeMenuOpen = !typeMenuOpen;
 		typeMenuIndex = Math.max(
 			0,
@@ -551,11 +687,38 @@
 	}
 
 	function openSortMenu() {
-		typeMenuOpen = false;
+		closeMenus();
 		sortMenuOpen = !sortMenuOpen;
 		sortMenuIndex = Math.max(
 			0,
 			SORT_OPTIONS.findIndex((o) => o.value === sortOption)
+		);
+	}
+
+	function openScopeMenu() {
+		closeMenus();
+		scopeMenuOpen = !scopeMenuOpen;
+		scopeMenuIndex = Math.max(
+			0,
+			SCOPE_OPTIONS.findIndex((o) => o.value === (scopeRoot ?? 'all'))
+		);
+	}
+
+	function openModeMenu() {
+		closeMenus();
+		modeMenuOpen = !modeMenuOpen;
+		modeMenuIndex = Math.max(
+			0,
+			MODE_OPTIONS.findIndex((o) => o.value === searchMode)
+		);
+	}
+
+	function openMatchMenu() {
+		closeMenus();
+		matchMenuOpen = !matchMenuOpen;
+		matchMenuIndex = Math.max(
+			0,
+			MATCH_OPTIONS.findIndex((o) => o.value === matchMode)
 		);
 	}
 
@@ -960,11 +1123,29 @@
 		const unlistenOcrProgress = listen<number>('dowse://ocr-progress', (evt) => {
 			applyOcrPending(evt.payload);
 		});
+		// 文件监听增量提交：每次 commit 推一个事件，这里合并高频事件后刷新结果 +
+		// 索引统计（文档数/占用）。见 watcher.rs 的 Committed 分支。
+		const unlistenIndexChanged = listen('dowse://index-changed', () => {
+			// 先亮"更新中"，再用 600ms 静默窗口把连续提交合并成一次刷新——
+			// 编辑文件时的连续 commit 不会把界面刷到抖；也不做每秒全盘扫描，
+			// 只重跑当前查询（索引 reader 已自动重载），由 searchToken 挡掉旧响应。
+			indexWatchActive = true;
+			if (indexChangedTimer !== null) clearTimeout(indexChangedTimer);
+			indexChangedTimer = setTimeout(() => {
+				indexChangedTimer = null;
+				indexWatchActive = false;
+				refreshIndexStatus();
+				// 有查询词才重跑结果（保留选中文件由搜索 effect 的 wasRefresh 分支处理）；
+				// 空查询只刷新索引统计即可，空态会随文档数变化。
+				if (effectiveQuery.trim().length > 0) refreshNonce++;
+			}, 600);
+		});
 
 		return () => {
 			splitResizeObserver.disconnect();
 			document.body.classList.remove('split-resizing');
 			document.removeEventListener('click', handleDocumentClick);
+			if (indexChangedTimer !== null) clearTimeout(indexChangedTimer);
 			unlistenShown.then((f) => f());
 			unlistenOpenSettings.then((f) => f());
 			unlistenEffect.then((f) => f());
@@ -975,6 +1156,7 @@
 			unlistenRebuildProgress.then((f) => f());
 			unlistenIndexingSettled.then((f) => f());
 			unlistenOcrProgress.then((f) => f());
+			unlistenIndexChanged.then((f) => f());
 		};
 	});
 </script>
@@ -982,23 +1164,8 @@
 <svelte:window onkeydown={handleWindowKeydown} />
 
 <div class="panel" bind:this={panelEl}>
-	{#each [
-		['North', 'n'],
-		['NorthEast', 'ne'],
-		['East', 'e'],
-		['SouthEast', 'se'],
-		['South', 's'],
-		['SouthWest', 'sw'],
-		['West', 'w'],
-		['NorthWest', 'nw']
-	] as resizeHandle}
-		<!-- svelte-ignore a11y_no_static_element_interactions: these transparent edges expose the native OS resize gesture for a frameless window -->
-		<div
-			class="window-resize-handle window-resize-{resizeHandle[1]}"
-			onmousedown={(e) => handleWindowResize(e, resizeHandle[0] as ResizeDirection)}
-			aria-hidden="true"
-		></div>
-	{/each}
+	<!-- 自绘的八个方向缩放热区已移除：窗口改用标准 Windows 标题栏后，缩放手势
+	     由系统边框提供。留着这些透明热区只会盖住内容边缘、拦截本该给内容的鼠标事件。 -->
 	<!-- svelte-ignore a11y_no_static_element_interactions: the blank title area maps to the native OS window-drag gesture; interactive descendants are excluded in handleWindowDrag -->
 	<div class="search-row" onmousedown={handleWindowDrag}>
 		<svg class="search-icon" width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
@@ -1048,6 +1215,60 @@
 			<PinButton {pinned} onclick={togglePinned} />
 			<SettingsButton onclick={openSettingsPanel} />
 		</div>
+	</div>
+
+	<!-- 第二行：范围 / 模式 / 匹配。刻意跟关键词输入框分行——挤在一行会让每个
+	     下拉都窄到只能显示图标，用户得逐个点开才知道当前选的是什么。 -->
+	<div class="filter-row">
+		<span class="flabel">{t.scopeLabel}</span>
+		<GhostDropdown
+			idleLabel={t.scopeAll}
+			options={SCOPE_OPTIONS}
+			value={scopeRoot ?? 'all'}
+			defaultValue="all"
+			menuAlign="left"
+			open={scopeMenuOpen}
+			bind:activeIndex={scopeMenuIndex}
+			onselect={(v) => {
+				scopeRoot = v === 'all' ? null : v;
+				closeMenus();
+			}}
+			ontoggle={openScopeMenu}
+		/>
+		<span class="flabel">{t.modeLabel}</span>
+		<GhostDropdown
+			idleLabel={t.modeContent}
+			options={MODE_OPTIONS}
+			value={searchMode}
+			defaultValue="content"
+			menuAlign="left"
+			open={modeMenuOpen}
+			bind:activeIndex={modeMenuIndex}
+			onselect={(v) => {
+				searchMode = v as SearchField;
+				closeMenus();
+			}}
+			ontoggle={openModeMenu}
+		/>
+		<span class="flabel">{t.matchLabel}</span>
+		<GhostDropdown
+			idleLabel={t.matchNormal}
+			options={MATCH_OPTIONS}
+			value={matchMode}
+			defaultValue="normal"
+			menuAlign="left"
+			open={matchMenuOpen}
+			bind:activeIndex={matchMenuIndex}
+			onselect={(v) => {
+				matchMode = v as 'normal' | 'phrase';
+				closeMenus();
+			}}
+			ontoggle={openMatchMenu}
+		/>
+		<span class="fspacer"></span>
+		<!-- 索引管理入口：文件夹、排除规则、体积上限这些原来只在托盘菜单里，
+		     用户遇到"这个文件怎么没被收录"时要先猜该去哪找。放主界面常驻。 -->
+		<button type="button" class="fbtn" onclick={openSettingsPanel}>{t.indexManage}</button>
 	</div>
 
 	<div
@@ -1110,8 +1331,13 @@
 				<ResultList
 					{hits}
 					{selectedIndex}
+					sort={sortOption}
+					onsort={(next) => (sortOption = next)}
 					onhover={(i) => (selectedIndex = i)}
 					onselect={(i) => {
+						selectedIndex = i;
+					}}
+					onopen={(i) => {
 						selectedIndex = i;
 						openSelected();
 					}}
@@ -1134,7 +1360,12 @@
 				onkeydown={handleDividerKeydown}
 			/>
 			<div class="preview-col">
-				<PreviewPane hit={selectedHit} segments={previewSegments} loading={previewLoading} />
+				<PreviewPane
+					hit={selectedHit}
+					segments={previewSegments}
+					loading={previewLoading}
+					kind={previewKind}
+				/>
 			</div>
 		{/if}
 	</div>
@@ -1146,6 +1377,23 @@
 	{#if indexingPhase === 'ocr'}
 		<IndexingStrip processed={indexingOcrProcessed} total={indexingOcrTotal} />
 	{/if}
+
+	<!-- 状态栏：命中数 / 搜索耗时 / 已索引 / 更新状态 / 索引占用。这些原来散在
+	     结果标题和托盘里，用户要"我的索引多大、有没有在更新"得去翻托盘——现在
+	     常驻底部一行，一眼能看完。 -->
+	<div class="statusbar">
+		<span class="sitem">{t.statusHits} <b>{totalHits}</b></span>
+		<span class="ssep">·</span>
+		<span class="sitem">{lastSearchMs === null ? '—' : `${Math.round(lastSearchMs)} ms`}</span>
+		<span class="ssep">·</span>
+		<span class="sitem">{t.statusIndexed} <b>{numDocs}</b></span>
+		{#if indexingPhase !== 'idle' || rebuildState === 'rebuilding' || indexWatchActive}
+			<span class="ssep">·</span>
+			<span class="sitem live">更新中…</span>
+		{/if}
+		<span class="sspacer"></span>
+		<span class="sitem">{t.statusIndexSize} <b>{formatBytes(indexUsage?.bytes ?? 0)}</b></span>
+	</div>
 
 	<ShortcutBar hasSelection={selectedHit !== null} />
 
@@ -1192,43 +1440,9 @@
 		overflow: hidden;
 	}
 
-	/* 无边框窗口的原生缩放热区。边 6px、角 12px，角层级更高，既容易命中
-	   又只覆盖最外圈；Windows 接管后可持续拖出 WebView 边界。 */
-	.window-resize-handle {
-		position: absolute;
-		z-index: 1000;
-	}
-
-	.window-resize-n,
-	.window-resize-s {
-		left: 12px;
-		right: 12px;
-		height: 6px;
-	}
-
-	.window-resize-e,
-	.window-resize-w {
-		top: 12px;
-		bottom: 12px;
-		width: 6px;
-	}
-
-	.window-resize-n { top: 0; cursor: n-resize; }
-	.window-resize-ne { top: 0; right: 0; cursor: ne-resize; }
-	.window-resize-e { right: 0; cursor: e-resize; }
-	.window-resize-se { right: 0; bottom: 0; cursor: se-resize; }
-	.window-resize-s { bottom: 0; cursor: s-resize; }
-	.window-resize-sw { bottom: 0; left: 0; cursor: sw-resize; }
-	.window-resize-w { left: 0; cursor: w-resize; }
-	.window-resize-nw { top: 0; left: 0; cursor: nw-resize; }
-
-	.window-resize-ne,
-	.window-resize-se,
-	.window-resize-sw,
-	.window-resize-nw {
-		width: 12px;
-		height: 12px;
-	}
+	/* 缩放热区的 CSS 已随自绘手柄一起删掉：改用标准窗口（decorations: true）后，
+	   缩放/最小化/最大化/关闭全交给 Windows 原生边框，这里再留 6px 边角热区
+	   只会挡住原生边框自己的热区，反而拖不动。 */
 
 	/* 输入区刻意不做"框"——没有边框、没有底色块，大字号裸排；下面这条
 	   1px 低对比发丝线才是分隔输入区和结果区的唯一视觉边界，Raycast 同款。 */
@@ -1242,7 +1456,7 @@
 	}
 
 	.search-icon {
-		color: var(--fg-tertiary);
+		color: var(--fg-secondary);
 		flex-shrink: 0;
 	}
 
@@ -1270,6 +1484,75 @@
 		align-items: center;
 		gap: 2px;
 		flex-shrink: 0;
+	}
+
+	/* 第二行筛选栏：范围 / 模式 / 匹配。左边留一点内缩，视觉上从属于上面的
+	   搜索行；整行不高，不给结果区挤太多高度。 */
+	.filter-row {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		flex-shrink: 0;
+		padding: 0 14px 6px;
+	}
+
+	.flabel {
+		font-size: 11px;
+		color: var(--fg-tertiary);
+		user-select: none;
+	}
+
+	.fspacer {
+		flex: 1;
+	}
+
+	/* 索引管理按钮：跟筛选下拉同一行，但压得更淡，避免跟"筛选条件"抢视觉重心。 */
+	.fbtn {
+		padding: 2px 8px;
+		border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.22));
+		border-radius: 5px;
+		background: transparent;
+		font: inherit;
+		font-size: 11px;
+		color: var(--fg-secondary);
+		cursor: pointer;
+	}
+
+	.fbtn:hover {
+		background: var(--row-hover);
+		color: var(--fg-primary);
+	}
+
+	/* 底部状态栏：命中数 / 耗时 / 已索引 / 更新状态 …… 索引占用 */
+	.statusbar {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		flex-shrink: 0;
+		padding: 3px 14px;
+		font-size: 11px;
+		color: var(--fg-tertiary);
+		border-top: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.14));
+	}
+
+	.statusbar b {
+		font-weight: 600;
+		color: var(--fg-secondary);
+	}
+
+	.ssep {
+		opacity: 0.45;
+	}
+
+	.sspacer {
+		flex: 1;
+	}
+
+	/* 正在建索引/增量更新时，"更新中…"跟别的状态项区分开——这是唯一会自己
+	   变化的字段，值得一点颜色。 */
+	.statusbar .live {
+		color: var(--accent-caret, var(--fg-secondary));
+		font-weight: 500;
 	}
 
 	.search-input::placeholder {
@@ -1357,13 +1640,13 @@
 	.pagination button {
 		display: grid;
 		place-items: center;
-		width: 24px;
-		height: 24px;
+		width: 26px;
+		height: 26px;
 		padding: 0;
 		border: 0;
 		border-radius: var(--radius-chip);
 		background: transparent;
-		color: var(--fg-secondary);
+		color: var(--fg-primary);
 		cursor: default;
 		transition:
 			background 90ms ease-out,
@@ -1461,7 +1744,7 @@
 		transform: translateX(-50%);
 		background: var(--toast-bg);
 		color: var(--toast-fg);
-		font-size: 12px;
+		font-size: 13px;
 		padding: 8px 16px;
 		border-radius: 8px;
 		pointer-events: none;
