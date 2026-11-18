@@ -10,6 +10,7 @@ mod perf;
 mod rebuild;
 mod state;
 mod tray;
+mod updates;
 mod watcher;
 mod window_fx;
 

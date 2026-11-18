@@ -9,6 +9,11 @@ foreach ($command in @('cargo', 'node', 'cl.exe')) {
 }
 Push-Location $PSScriptRoot
 try {
+    foreach ($updateFile in @('AppUpdates.ps1', 'app-update.json')) {
+        if (-not (Test-Path -LiteralPath "crates\dowse-app\src-tauri\updates\$updateFile" -PathType Leaf)) {
+            throw "Missing packaged update component: $updateFile."
+        }
+    }
     if (-not $SkipFrontend) {
         Push-Location 'crates\dowse-app'
         try {
@@ -27,5 +32,10 @@ try {
     Copy-Item -LiteralPath 'target\release\dowse.exe' -Destination 'crates\dowse-app\src-tauri\binaries\dowse-x86_64-pc-windows-msvc.exe'
     & cargo build --release --locked -p dowse-app --features custom-protocol
     if ($LASTEXITCODE -ne 0) { throw 'Desktop build failed. Close the app before rebuilding.' }
+    # cargo build creates the portable EXE; Tauri bundles the same resources for NSIS.
+    New-Item -ItemType Directory -Path 'target\release\updates' -Force | Out-Null
+    foreach ($updateFile in @('AppUpdates.ps1', 'app-update.json')) {
+        Copy-Item -LiteralPath "crates\dowse-app\src-tauri\updates\$updateFile" -Destination "target\release\updates\$updateFile"
+    }
     Write-Host "Standalone app: $PSScriptRoot\target\release\dowse-app.exe"
 } finally { Pop-Location }

@@ -97,6 +97,7 @@ fn decode_rgba_png(bytes: &[u8]) -> (Vec<u8>, u32, u32) {
 
 const MENU_SHOW: &str = "show";
 const MENU_SETTINGS: &str = "settings";
+const MENU_UPDATE: &str = "check_updates";
 const MENU_FOLDERS_ADD: &str = "folders_add";
 const MENU_AUTOSTART: &str = "autostart";
 const MENU_TRANSPARENCY: &str = "transparency";
@@ -205,6 +206,7 @@ fn build_menu(app: &AppHandle, busy: bool) -> tauri::Result<Menu<tauri::Wry>> {
 
     let show_item = MenuItemBuilder::with_id(MENU_SHOW, s.menu_show).build(app)?;
     let settings_item = MenuItemBuilder::with_id(MENU_SETTINGS, s.menu_settings).build(app)?;
+    let update_item = MenuItemBuilder::with_id(MENU_UPDATE, s.menu_update).build(app)?;
     let folders_submenu = build_folders_submenu(app, busy)?;
 
     let autostart_item = CheckMenuItemBuilder::with_id(MENU_AUTOSTART, s.menu_autostart)
@@ -244,6 +246,7 @@ fn build_menu(app: &AppHandle, busy: bool) -> tauri::Result<Menu<tauri::Wry>> {
         &[
             &show_item,
             &settings_item,
+            &update_item,
             &folders_submenu,
             &PredefinedMenuItem::separator(app)?,
             &autostart_item,
@@ -422,6 +425,14 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
             if let Some(window) = app.get_webview_window("main") {
                 window_fx::show_window(&window);
                 let _ = window.emit("dowse://open-settings", ());
+            }
+        }
+        MENU_UPDATE => {
+            if let Err(error) = crate::updates::open_update_window() {
+                app.dialog()
+                    .message(error)
+                    .title(crate::i18n::strings().menu_update)
+                    .show(|_| {});
             }
         }
         MENU_FOLDERS_ADD => add_folder(app),
