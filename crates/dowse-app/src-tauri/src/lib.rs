@@ -139,6 +139,8 @@ pub fn run() {
             context_menu::show_result_context_menu,
         ])
         .setup(move |app| {
+            #[cfg(windows)]
+            let _ = updates::launch_updates(true);
             // 快捷键抢注册失败（常见原因：被输入法或别的常驻工具占用了）
             // 不该让整个应用起不来——托盘的"呼出"菜单项还能用，把错误打到日志就行。
             match app.global_shortcut().register(toggle) {

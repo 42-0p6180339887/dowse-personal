@@ -53,6 +53,11 @@ fn system_powershell() -> Result<PathBuf, String> {
 
 #[cfg(windows)]
 pub fn open_update_window() -> Result<(), String> {
+    launch_updates(false)
+}
+
+#[cfg(windows)]
+pub fn launch_updates(startup: bool) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
@@ -60,12 +65,16 @@ pub fn open_update_window() -> Result<(), String> {
     let resources = packaged_child(base, "updates", true)?;
     let script = packaged_child(&resources, "AppUpdates.ps1", false)?;
     let config = packaged_child(&resources, "app-update.json", false)?;
-    Command::new(system_powershell()?)
+    let mut command = Command::new(system_powershell()?);
+    command
         .args(["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(script)
         .arg("-Config")
-        .arg(config)
-        .current_dir(base)
+        .arg(config);
+    if startup {
+        command.arg("-StartupCheck");
+    }
+    command.current_dir(base)
         .creation_flags(0x08000000) // CREATE_NO_WINDOW; the script owns its GUI.
         .stdin(Stdio::null())
         .stdout(Stdio::null())
